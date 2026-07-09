@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: removal-sync
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: LWA_CLIENT_ID
+        sync: false
+      - key: LWA_CLIENT_SECRET
+        sync: false
+      - key: SPAPI_REFRESH_TOKEN
+        sync: false
+      - key: NOTION_TOKEN
+        sync: false
+      - key: NOTION_DATABASE_ID
+        sync: false
+      - key: NOTION_PARENT_PAGE_ID
+        sync: false
