@@ -87,7 +87,16 @@ def poll_report(token: str, report_id: str, timeout_s: int = 600) -> str | None:
         if status == "CANCELLED":
             return None  # no data in range
         if status == "FATAL":
-            raise HTTPException(502, f"Report {report_id} FATAL")
+            detail = f"Report {report_id} FATAL"
+            doc_id = body.get("reportDocumentId")
+            if doc_id:
+                try:  # Amazon attaches an error document explaining the failure
+                    detail += " — Amazon says: " + download_report(token, doc_id)[:500]
+                except Exception as e:
+                    detail += f" — error doc fetch failed: {e}"
+            else:
+                detail += " — no error document provided (v2)"
+            raise HTTPException(502, detail)
         time.sleep(15)
     raise HTTPException(504, f"Timed out waiting for report {report_id}")
 
@@ -262,6 +271,7 @@ def create_page(db_id: str, row: dict):
 
 # ------------------------------------------------------------------ routes --
 
+@app.head("/")
 @app.get("/", response_class=HTMLResponse)
 def home():
     return """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
