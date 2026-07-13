@@ -310,6 +310,23 @@ def list_recent_reports(token: str, hours_back: int = 48) -> list[dict]:
     return r.json().get("reports", [])
 
 
+def _parse_dt(v: str):
+    try:
+        return datetime.fromisoformat(v.strip().replace(" ", "T", 1))
+    except Exception:
+        return None
+
+
+def filter_rows_to_window(rows: list[dict], start: datetime, end: datetime) -> list[dict]:
+    """Keep rows whose shipment-date (or request-date if blank) falls in window."""
+    kept = []
+    for row in rows:
+        dt = _parse_dt(row.get("shipment-date", "")) or _parse_dt(row.get("request-date", ""))
+        if dt is None or (start <= dt <= end):
+            kept.append(row)
+    return kept
+
+
 def pull_report_rows(days: int, force_new: bool = False) -> tuple[list[dict], str]:
     for name, val in [("LWA_CLIENT_ID", LWA_CLIENT_ID), ("LWA_CLIENT_SECRET", LWA_CLIENT_SECRET),
                       ("SPAPI_REFRESH_TOKEN", SPAPI_REFRESH_TOKEN)]:
@@ -321,20 +338,29 @@ def pull_report_rows(days: int, force_new: bool = False) -> tuple[list[dict], st
     end_iso = end.strftime("%Y-%m-%dT%H:%M:%SZ")
     token = lwa_token()
 
-    # Reuse a recently completed report if one exists (avoids the ~2h
-    # frequency throttle on this report type; Seller Central-generated
-    # reports count too).
-    if not force_new:
-        for rep in list_recent_reports(token, hours_back=6):
-            if rep.get("processingStatus") == "DONE" and rep.get("reportDocumentId"):
-                rows = parse_tsv(download_report(token, rep["reportDocumentId"]))
-                window = f"REUSED report {rep['reportId']} created {rep.get('createdTime','?')} (data {rep.get('dataStartTime','?')} -> {rep.get('dataEndTime','?')})"
-                return rows, window
+    # Always request the exact window first.
+    try:
+        report_id = request_report(token, start_iso, end_iso)
+        doc_id = poll_report(token, report_id)
+        rows = parse_tsv(download_report(token, doc_id)) if doc_id else []
+        return rows, f"{start_iso} -> {end_iso}"
+    except HTTPException as e:
+        if e.status_code != 502:
+            raise
+        fatal_error = e
 
-    report_id = request_report(token, start_iso, end_iso)
-    doc_id = poll_report(token, report_id)
-    rows = parse_tsv(download_report(token, doc_id)) if doc_id else []
-    return rows, f"{start_iso} -> {end_iso}"
+    # Fresh request FATALed (usually the ~2h frequency throttle).
+    # Fall back to the most recent completed report and trim to the window.
+    for rep in list_recent_reports(token, hours_back=6):
+        if rep.get("processingStatus") == "DONE" and rep.get("reportDocumentId"):
+            rows = parse_tsv(download_report(token, rep["reportDocumentId"]))
+            rows = filter_rows_to_window(rows, start, end)
+            window = (f"{start_iso} -> {end_iso} "
+                      f"(fresh request throttled; rows trimmed from reused report "
+                      f"{rep['reportId']} created {rep.get('createdTime','?')})")
+            return rows, window
+
+    raise fatal_error
 
 
 @app.get("/reports")
