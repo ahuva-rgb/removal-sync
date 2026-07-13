@@ -87,7 +87,16 @@ def poll_report(token: str, report_id: str, timeout_s: int = 600) -> str | None:
         if status == "CANCELLED":
             return None  # no data in range
         if status == "FATAL":
-            raise HTTPException(502, f"Report {report_id} FATAL")
+            detail = f"Report {report_id} FATAL"
+            doc_id = body.get("reportDocumentId")
+            if doc_id:
+                try:  # Amazon attaches an error document explaining the failure
+                    detail += " — Amazon says: " + download_report(token, doc_id)[:500]
+                except Exception as e:
+                    detail += f" — error doc fetch failed: {e}"
+            else:
+                detail += " — no error document provided (v2)"
+            raise HTTPException(502, detail)
         time.sleep(15)
     raise HTTPException(504, f"Timed out waiting for report {report_id}")
 
@@ -262,6 +271,7 @@ def create_page(db_id: str, row: dict):
 
 # ------------------------------------------------------------------ routes --
 
+@app.head("/")
 @app.get("/", response_class=HTMLResponse)
 def home():
     return """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
@@ -288,7 +298,19 @@ CSV_COLUMNS = ["request-date", "order-id", "shipment-date", "sku", "fnsku",
                "removal-order-type", "order-source", "shipment-id"]
 
 
-def pull_report_rows(days: int) -> tuple[list[dict], str]:
+def list_recent_reports(token: str, hours_back: int = 48) -> list[dict]:
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours_back)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    r = requests.get(
+        f"{SPAPI_ENDPOINT}/reports/2021-06-30/reports",
+        headers={"x-amz-access-token": token},
+        params={"reportTypes": SHIPMENT_REPORT, "createdSince": since, "pageSize": 100},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json().get("reports", [])
+
+
+def pull_report_rows(days: int, force_new: bool = False) -> tuple[list[dict], str]:
     for name, val in [("LWA_CLIENT_ID", LWA_CLIENT_ID), ("LWA_CLIENT_SECRET", LWA_CLIENT_SECRET),
                       ("SPAPI_REFRESH_TOKEN", SPAPI_REFRESH_TOKEN)]:
         if not val:
@@ -298,17 +320,40 @@ def pull_report_rows(days: int) -> tuple[list[dict], str]:
     start_iso = start.strftime("%Y-%m-%dT%H:%M:%SZ")
     end_iso = end.strftime("%Y-%m-%dT%H:%M:%SZ")
     token = lwa_token()
+
+    # Reuse a recently completed report if one exists (avoids the ~2h
+    # frequency throttle on this report type; Seller Central-generated
+    # reports count too).
+    if not force_new:
+        for rep in list_recent_reports(token, hours_back=6):
+            if rep.get("processingStatus") == "DONE" and rep.get("reportDocumentId"):
+                rows = parse_tsv(download_report(token, rep["reportDocumentId"]))
+                window = f"REUSED report {rep['reportId']} created {rep.get('createdTime','?')} (data {rep.get('dataStartTime','?')} -> {rep.get('dataEndTime','?')})"
+                return rows, window
+
     report_id = request_report(token, start_iso, end_iso)
     doc_id = poll_report(token, report_id)
     rows = parse_tsv(download_report(token, doc_id)) if doc_id else []
     return rows, f"{start_iso} -> {end_iso}"
 
 
+@app.get("/reports")
+def recent_reports(hours: int = Query(48, ge=1, le=720)):
+    """Debug: show recent report requests for this type and their statuses."""
+    token = lwa_token()
+    reps = list_recent_reports(token, hours_back=hours)
+    return [{"reportId": r.get("reportId"),
+             "status": r.get("processingStatus"),
+             "created": r.get("createdTime"),
+             "dataWindow": f"{r.get('dataStartTime','?')} -> {r.get('dataEndTime','?')}",
+             "hasDocument": bool(r.get("reportDocumentId"))} for r in reps]
+
+
 @app.post("/preview")
 @app.get("/preview")
-def preview(days: int = Query(30, ge=1, le=540)):
+def preview(days: int = Query(30, ge=1, le=540), force_new: bool = Query(False)):
     """Pull from Amazon and return the CSV. NO Notion writes."""
-    rows, window = pull_report_rows(days)
+    rows, window = pull_report_rows(days, force_new)
     out = io.StringIO()
     writer = csv.DictWriter(out, fieldnames=CSV_COLUMNS, extrasaction="ignore")
     writer.writeheader()
@@ -327,7 +372,7 @@ def preview(days: int = Query(30, ge=1, le=540)):
 def sync(days: int = Query(30, ge=1, le=540)):
     if not NOTION_TOKEN:
         raise HTTPException(500, "Missing env var: NOTION_TOKEN")
-    rows, window = pull_report_rows(days)
+    rows, window = pull_report_rows(days)  # reuses recent DONE report when available
 
     db_id = ensure_database()
     existing = existing_rows(db_id)
