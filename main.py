@@ -24,6 +24,13 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 
 app = FastAPI(title="Removal Sync")
 
+
+@app.exception_handler(Exception)
+async def unhandled(request, exc):
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=500,
+                        content={"detail": f"{type(exc).__name__}: {exc} (v3)"})
+
 LWA_CLIENT_ID = os.environ.get("LWA_CLIENT_ID", "")
 LWA_CLIENT_SECRET = os.environ.get("LWA_CLIENT_SECRET", "")
 SPAPI_REFRESH_TOKEN = os.environ.get("SPAPI_REFRESH_TOKEN", "")
