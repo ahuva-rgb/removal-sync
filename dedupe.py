@@ -395,14 +395,18 @@ def apply(job_id: str = Query(...),
         if running:
             raise HTTPException(409, "An apply is already running for this scan.")
 
-    rows = job["plan"]
-    carries_work = [d for d in rows if d["work_score"] > 0]
-    if carries_work and not force:
+    # Rows carrying human work are held back by default and the rest still go.
+    # force=true archives them too. Either way the decision is explicit, and
+    # holding some back never blocks the clean majority.
+    all_rows = job["plan"]
+    carries_work = [d for d in all_rows if d["work_score"] > 0]
+    rows = all_rows if force else [d for d in all_rows if d["work_score"] == 0]
+    held_back = [] if force else carries_work
+    if not rows:
         raise HTTPException(
             409,
-            f"{len(carries_work)} rows due for archiving carry human work "
-            f"(frame status, processed-by, or a linked prep/stock/warranty record). "
-            f"Review them at /dedupe/plan, then pass force=true if you still want them gone.",
+            f"Every row in this plan carries human work ({len(carries_work)}), so with "
+            f"force=false there is nothing left to archive. Review them at /dedupe/plan.",
         )
     if len(rows) > max_archive:
         raise HTTPException(
@@ -415,9 +419,12 @@ def apply(job_id: str = Query(...),
     job.setdefault("applies", {})[apply_id] = {
         "id": apply_id, "stage": "running", "started_at": time.time(),
         "total": len(rows), "done": 0, "archived": 0, "failed": [], "rows": rows,
+        "held_back_carrying_work": len(held_back),
+        "held_back_pages": [d["url"] for d in held_back],
     }
     threading.Thread(target=_run_apply, args=(job_id, apply_id), daemon=True).start()
     return {"apply_id": apply_id, "total": len(rows),
+            "held_back_carrying_work": len(held_back),
             "poll": f"/dedupe/apply/status?job_id={job_id}&apply_id={apply_id}&key=..."}
 
 
@@ -480,7 +487,8 @@ Archived items go to Notion's trash and can be restored for 30 days.
 <div id=step2 style="display:none;border-top:1px solid #ddd;padding-top:18px;margin-top:8px">
   <p><a id=csv href="#" style="font-size:14px">Download the full list as CSV</a> &mdash; worth keeping before you apply.</p>
   <p>
-  <label style="font-size:14px"><input type=checkbox id=force> also archive rows carrying human work</label><br>
+  <label style="font-size:14px"><input type=checkbox id=force onchange=relabel()>
+    also archive rows carrying human work <span id=workNote style="color:#666"></span></label><br>
   <button id=applyBtn onclick=apply() style="padding:10px 22px;font-size:15px;margin-top:10px;background:#b52d2d;color:#fff;border:0;border-radius:4px">
     2. Archive the surplus</button>
   </p>
@@ -488,8 +496,19 @@ Archived items go to Notion's trash and can be restored for 30 days.
 </div>
 
 <script>
-let job = null;
+let job = null, lastSummary = null;
 const K = () => encodeURIComponent(document.getElementById('k').value.trim());
+
+function relabel() {
+  if (!lastSummary) return;
+  const work = lastSummary.archive_carrying_work || 0;
+  const force = document.getElementById('force').checked;
+  const n = force ? lastSummary.archive : lastSummary.archive - work;
+  applyBtn.textContent = '2. Archive ' + n + ' surplus items';
+  workNote.textContent = work
+    ? (force ? '(' + work + " included)" : '(' + work + ' will be left alone)')
+    : '(none in this plan)';
+}
 const show = (el, o) => document.getElementById(el).textContent =
       typeof o === 'string' ? o : JSON.stringify(o, null, 2);
 
@@ -515,7 +534,8 @@ async function scan() {
       if (st.stage === 'done') {
         show('out', st.summary);
         csv.href = '/dedupe/plan.csv?job_id=' + job + '&key=' + K();
-        applyBtn.textContent = '2. Archive ' + st.summary.archive + ' surplus items';
+        lastSummary = st.summary;
+        relabel();
         step2.style.display = 'block';
         break;
       }
@@ -540,6 +560,8 @@ async function apply() {
       const st = await jf('/dedupe/apply/status?job_id=' + job + '&apply_id=' + a.apply_id + '&key=' + K());
       show('out2', 'archived ' + st.archived + ' of ' + st.total +
                    (st.failed_count ? '   (' + st.failed_count + ' failed)' : '') +
+                   (st.held_back_carrying_work
+                     ? '\\nleft alone (carry human work): ' + st.held_back_carrying_work : '') +
                    (st.stage === 'done' ? '\\n\\nDone.' : ''));
       if (st.stage === 'done') break;
     }
