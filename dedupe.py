@@ -29,7 +29,9 @@ Safety properties
 
 from __future__ import annotations
 
+import csv
 import hmac
+import io
 import os
 import re
 import threading
@@ -39,6 +41,7 @@ from collections import defaultdict
 
 import requests
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import HTMLResponse, PlainTextResponse
 
 router = APIRouter(prefix="/dedupe", tags=["dedupe"])
 
@@ -426,3 +429,127 @@ def apply_status(job_id: str = Query(...), apply_id: str = Query(...), key: str 
     if not run:
         raise HTTPException(404, "No such apply run.")
     return {k: v for k, v in run.items() if k != "rows"} | {"failed_count": len(run["failed"])}
+
+
+@router.get("/plan.csv", response_class=PlainTextResponse)
+def plan_csv(job_id: str = Query(...), key: str = Query(...)):
+    """The whole archive list as CSV, for keeping a record before you apply."""
+    _auth(key)
+    job = _jobs.get(job_id)
+    if not job or job.get("plan") is None:
+        raise HTTPException(404, "No finished scan with that id.")
+    rows = job["plan"]
+    buf = io.StringIO()
+    cols = ["tracking", "sku", "amazon_units", "in_notion", "created",
+            "by_materialiser", "work_score", "page_id", "url", "title"]
+    w = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
+    w.writeheader()
+    w.writerows(rows)
+    return PlainTextResponse(
+        buf.getvalue(),
+        headers={"Content-Disposition": f'attachment; filename="duplicates_{job_id}.csv"'},
+    )
+
+
+# ------------------------------------------------------------------- the page
+
+PAGE = """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Removal box de-duplication</title>
+<body style="font-family:system-ui,sans-serif;max-width:760px;margin:32px auto;padding:0 16px;color:#1a1a1a">
+<h2 style="margin-bottom:4px">Removal box de-duplication</h2>
+<p style="color:#666;margin-top:0">Reconciles Warehouse Box Items against the quantities Amazon actually shipped.</p>
+
+<div style="background:#f0f7ff;border-left:3px solid #2b6cb0;padding:12px 16px;margin:20px 0;font-size:14px;line-height:1.55">
+<b>What it will and won't touch</b><br>
+A box is only ever reduced <i>down to</i> the number of units Amazon shipped &mdash; never below.<br>
+A tracking+SKU pair with no Amazon line is skipped entirely.<br>
+Items carrying human work (frame status, processed-by, or a prep / stock / don't-sell / warranty link) are kept first.<br>
+Archived items go to Notion's trash and can be restored for 30 days.
+</div>
+
+<p><label>Key <input id=k type=password size=40 placeholder="paste the dedupe key"
+   style="padding:6px;font-family:monospace"></label></p>
+
+<p>
+<button id=scanBtn onclick=scan() style="padding:10px 22px;font-size:15px">1. Run scan (read-only)</button>
+<span id=scanNote style="color:#666;margin-left:10px;font-size:14px"></span>
+</p>
+
+<pre id=out style="background:#f4f4f4;padding:14px;white-space:pre-wrap;border-radius:4px;font-size:13px;min-height:20px"></pre>
+
+<div id=step2 style="display:none;border-top:1px solid #ddd;padding-top:18px;margin-top:8px">
+  <p><a id=csv href="#" style="font-size:14px">Download the full list as CSV</a> &mdash; worth keeping before you apply.</p>
+  <p>
+  <label style="font-size:14px"><input type=checkbox id=force> also archive rows carrying human work</label><br>
+  <button id=applyBtn onclick=apply() style="padding:10px 22px;font-size:15px;margin-top:10px;background:#b52d2d;color:#fff;border:0;border-radius:4px">
+    2. Archive the surplus</button>
+  </p>
+  <pre id=out2 style="background:#f4f4f4;padding:14px;white-space:pre-wrap;border-radius:4px;font-size:13px"></pre>
+</div>
+
+<script>
+let job = null;
+const K = () => encodeURIComponent(document.getElementById('k').value.trim());
+const show = (el, o) => document.getElementById(el).textContent =
+      typeof o === 'string' ? o : JSON.stringify(o, null, 2);
+
+async function jf(url, opts) {
+  const r = await fetch(url, opts);
+  let b; try { b = await r.json(); } catch (e) { b = { raw: await r.text() }; }
+  if (!r.ok) throw new Error((b && b.detail) ? b.detail : JSON.stringify(b));
+  return b;
+}
+
+async function scan() {
+  if (!document.getElementById('k').value.trim()) return show('out', 'Paste the key first.');
+  scanBtn.disabled = true;
+  step2.style.display = 'none';
+  show('out', 'Starting...');
+  try {
+    const s = await jf('/dedupe/scan?key=' + K(), { method: 'POST' });
+    job = s.job_id;
+    while (true) {
+      await new Promise(r => setTimeout(r, 2000));
+      const st = await jf('/dedupe/status?job_id=' + job + '&key=' + K());
+      if (st.stage === 'error') { show('out', 'Error: ' + st.error); break; }
+      if (st.stage === 'done') {
+        show('out', st.summary);
+        csv.href = '/dedupe/plan.csv?job_id=' + job + '&key=' + K();
+        applyBtn.textContent = '2. Archive ' + st.summary.archive + ' surplus items';
+        step2.style.display = 'block';
+        break;
+      }
+      show('out', st.stage + '  ' + JSON.stringify(
+        Object.fromEntries(Object.entries(st).filter(([a]) => a.endsWith('_rows') || a === 'boxes'))));
+    }
+  } catch (e) { show('out', 'Error: ' + e.message); }
+  scanBtn.disabled = false;
+}
+
+async function apply() {
+  if (!job) return;
+  if (!confirm('Archive the surplus items? They go to Notion\\'s trash and can be restored for 30 days.')) return;
+  applyBtn.disabled = true;
+  show('out2', 'Starting...');
+  try {
+    const a = await jf('/dedupe/apply?job_id=' + job + '&key=' + K() +
+                       '&confirm=ARCHIVE&force=' + document.getElementById('force').checked,
+                       { method: 'POST' });
+    while (true) {
+      await new Promise(r => setTimeout(r, 2000));
+      const st = await jf('/dedupe/apply/status?job_id=' + job + '&apply_id=' + a.apply_id + '&key=' + K());
+      show('out2', 'archived ' + st.archived + ' of ' + st.total +
+                   (st.failed_count ? '   (' + st.failed_count + ' failed)' : '') +
+                   (st.stage === 'done' ? '\\n\\nDone.' : ''));
+      if (st.stage === 'done') break;
+    }
+  } catch (e) { show('out2', 'Stopped: ' + e.message); }
+  applyBtn.disabled = false;
+}
+</script>"""
+
+
+@router.get("", response_class=HTMLResponse)
+@router.get("/", response_class=HTMLResponse)
+def page():
+    return PAGE
