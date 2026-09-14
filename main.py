@@ -278,6 +278,15 @@ def create_page(db_id: str, row: dict):
 
 # ------------------------------------------------------------------ routes --
 
+# Box de-duplication lives in its own module. Mounting it is wrapped so that a
+# problem there can never stop the removal sync itself from starting.
+try:
+    from dedupe import router as dedupe_router
+    app.include_router(dedupe_router)
+except Exception as _dedupe_exc:  # pragma: no cover
+    print(f"dedupe router not mounted: {type(_dedupe_exc).__name__}: {_dedupe_exc}")
+
+
 @app.head("/")
 @app.get("/", response_class=HTMLResponse)
 def home():
