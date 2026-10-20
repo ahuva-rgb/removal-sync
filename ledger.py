@@ -394,3 +394,30 @@ def status():
                 "recent_runs": runs}
     finally:
         conn.close()
+
+
+# --------------------------------------------------------- auto-backfill ---
+
+def maybe_start_backfill():
+    """On boot: if LEDGER_BACKFILL_ON_START=1 and no backfill has finished OK yet,
+    start one in the background. Safe to repeat - loads are idempotent."""
+    if os.environ.get("LEDGER_BACKFILL_ON_START") != "1" or not DATABASE_URL:
+        return
+    try:
+        conn = _db()
+        _ensure_base_tables(conn)
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM ledger_sync_runs WHERE mode='backfill' AND status='ok'")
+            done = cur.fetchone()[0]
+        conn.close()
+        print(f"ledger: database reachable; completed backfills = {done}")
+        if done == 0 and _run_lock.acquire(blocking=False):
+            threading.Thread(target=_run_in_background, args=("backfill",), daemon=True).start()
+            print("ledger: backfill started")
+    except Exception as exc:
+        print(f"ledger: auto-backfill check failed: {type(exc).__name__}: {exc}")
+
+
+@router.on_event("startup")
+def _on_startup():
+    threading.Thread(target=maybe_start_backfill, daemon=True).start()
