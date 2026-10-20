@@ -122,8 +122,12 @@ def _db():
     return psycopg.connect(DATABASE_URL, autocommit=True)
 
 
+_SETUP_LOCK = threading.Lock()
+
+
 def _ensure_base_tables(conn):
-    with conn.cursor() as cur:
+    with _SETUP_LOCK, conn.cursor() as cur:
+        cur.execute("SET lock_timeout = '10s'")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS ledger_detail (
                 id bigserial PRIMARY KEY,
@@ -222,28 +226,36 @@ def _create_report(token: str, report_type: str, start: date, end: date, options
     return r.json()["reportId"]
 
 
-def _iter_report_rows(report_type: str, start: date, end: date, options: dict | None = None):
-    """Yield one dict per report line, streamed straight from Amazon's file.
+def _download_report(report_type: str, start: date, end: date, options: dict | None = None):
+    """Create the report, wait for it, and stream it to a temp file. Returns the path or None.
 
-    Nothing holds the whole report in memory: the download is decompressed and
-    parsed line by line, so a big window can't blow the instance's RAM.
+    Done before any database transaction is opened, so a slow Amazon download never
+    holds a lock that could make a chat question wait.
     """
     import main
+    import tempfile
     token = main.lwa_token()
     report_id = _with_retry(_create_report, token, report_type, start, end, options)
     doc_id = main.poll_report(token, report_id, timeout_s=1800)
     if not doc_id:
-        return  # CANCELLED = no data in window
+        return None  # CANCELLED = no data in window
     token = main.lwa_token()  # tokens last 1h; refresh before download
     meta = requests.get(f"{main.SPAPI_ENDPOINT}/reports/2021-06-30/documents/{doc_id}",
                         headers={"x-amz-access-token": token}, timeout=30)
     meta.raise_for_status()
     meta = meta.json()
-    with requests.get(meta["url"], stream=True, timeout=300) as resp:
+    fd, path = tempfile.mkstemp(prefix="ledger_", suffix=".gz" if meta.get("compressionAlgorithm") == "GZIP" else ".tsv")
+    with os.fdopen(fd, "wb") as fh, requests.get(meta["url"], stream=True, timeout=300) as resp:
         resp.raise_for_status()
-        raw = resp.raw
-        if meta.get("compressionAlgorithm") == "GZIP":
-            raw = gzip.GzipFile(fileobj=raw)
+        for chunk in resp.iter_content(1 << 20):
+            fh.write(chunk)
+    return path
+
+
+def _iter_file_rows(path: str):
+    """Yield one dict per line of a downloaded report file, without loading it all."""
+    raw = gzip.open(path, "rb") if path.endswith(".gz") else open(path, "rb")
+    with raw:
         text = io.TextIOWrapper(raw, encoding="utf-8", errors="replace", newline="")
         for row in csv.DictReader(text, delimiter="\t"):
             yield {(k or "").strip().lower(): (v or "").strip() for k, v in row.items()}
@@ -273,8 +285,10 @@ def _insert_stream(conn, table: str, rows, fixed: dict) -> int:
     return n
 
 
-def _detail_rows(start: date, end: date):
-    for raw in _iter_report_rows(DETAIL_REPORT, start, end):
+def _detail_rows(path, start: date, end: date):
+    if not path:
+        return
+    for raw in _iter_file_rows(path):
         r = {}
         for k, v in raw.items():
             c = _col(k)
@@ -290,25 +304,39 @@ def _detail_rows(start: date, end: date):
 
 
 def _load_detail_window(conn, start: date, end: date) -> int:
-    with conn.transaction():
-        conn.execute("DELETE FROM ledger_detail WHERE event_date BETWEEN %s AND %s", (start, end))
-        n = _insert_stream(conn, "ledger_detail", _detail_rows(start, end), {})
-        _mark_loaded(conn, "detail", start, end, n)
+    path = _download_report(DETAIL_REPORT, start, end)
+    try:
+        with conn.transaction():
+            conn.execute("DELETE FROM ledger_detail WHERE event_date BETWEEN %s AND %s", (start, end))
+            n = _insert_stream(conn, "ledger_detail", _detail_rows(path, start, end), {})
+            _mark_loaded(conn, "detail", start, end, n)
+    finally:
+        if path:
+            os.remove(path)
     return n
 
 
-def _summary_rows(month_start: date, month_end: date):
-    opts = {"aggregateByLocation": "COUNTRY", "aggregatedByTimePeriod": "MONTHLY"}
-    for raw in _iter_report_rows(SUMMARY_REPORT, month_start, month_end, opts):
+SUMMARY_OPTIONS = {"aggregateByLocation": "COUNTRY", "aggregatedByTimePeriod": "MONTHLY"}
+
+
+def _summary_rows(path):
+    if not path:
+        return
+    for raw in _iter_file_rows(path):
         yield {("report_date_label" if _col(k) == "date" else _col(k)): v for k, v in raw.items()}
 
 
 def _load_summary_month(conn, month_start: date, month_end: date) -> int:
-    with conn.transaction():
-        conn.execute("DELETE FROM ledger_summary WHERE period_month = %s", (month_start,))
-        n = _insert_stream(conn, "ledger_summary", _summary_rows(month_start, month_end),
-                           {"period_month": month_start})
-        _mark_loaded(conn, "summary", month_start, month_end, n)
+    path = _download_report(SUMMARY_REPORT, month_start, month_end, SUMMARY_OPTIONS)
+    try:
+        with conn.transaction():
+            conn.execute("DELETE FROM ledger_summary WHERE period_month = %s", (month_start,))
+            n = _insert_stream(conn, "ledger_summary", _summary_rows(path),
+                               {"period_month": month_start})
+            _mark_loaded(conn, "summary", month_start, month_end, n)
+    finally:
+        if path:
+            os.remove(path)
     return n
 
 
@@ -454,6 +482,12 @@ def maybe_start_backfill():
             done = cur.fetchone()[0]
         conn.close()
         print(f"ledger: database reachable; completed backfills = {done}")
+        try:  # set up the connector's read-only login now, not on someone's first question
+            import mcp_ledger
+            mcp_ledger.ensure_reader()
+            mcp_ledger._reader_ready = True
+        except Exception as exc:
+            print(f"ledger: reader setup deferred: {type(exc).__name__}: {exc}")
         with _db() as c2:
             c2.execute("UPDATE ledger_sync_runs SET status='interrupted', finished_at=now() "
                        "WHERE status='running'")
@@ -469,6 +503,13 @@ def maybe_start_backfill():
         print(f"ledger: auto-backfill check failed: {type(exc).__name__}: {exc}")
 
 
+_started = False
+
+
 @router.on_event("startup")
 def _on_startup():
+    global _started
+    if _started:  # startup hooks can fire twice when the router is included
+        return
+    _started = True
     threading.Thread(target=maybe_start_backfill, daemon=True).start()

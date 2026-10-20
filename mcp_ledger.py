@@ -32,7 +32,7 @@ READER_PASSWORD = os.environ.get("LEDGER_READER_PASSWORD", "")
 MCP_PATH_TOKEN = os.environ.get("MCP_PATH_TOKEN", "")
 
 READER_ROLE = "ledger_reader"
-TABLES = ("ledger_detail", "ledger_summary", "ledger_sync_runs")
+TABLES = ("ledger_detail", "ledger_summary", "ledger_sync_runs", "ledger_loaded_windows")
 MAX_ROWS = 2000
 SUPPORTED_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 
@@ -80,6 +80,7 @@ def ensure_reader():
     with psycopg.connect(DATABASE_URL, autocommit=True) as conn:
         ledger._ensure_base_tables(conn)
         with conn.cursor() as cur:
+            cur.execute("SET lock_timeout = '10s'")
             cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (READER_ROLE,))
             verb = "ALTER" if cur.fetchone() else "CREATE"
             pw = READER_PASSWORD.replace("'", "''")
@@ -88,8 +89,10 @@ def ensure_reader():
             cur.execute(f'GRANT CONNECT ON DATABASE "{db}" TO {READER_ROLE}')
             cur.execute(f"GRANT USAGE ON SCHEMA public TO {READER_ROLE}")
             cur.execute(f"REVOKE CREATE ON SCHEMA public FROM {READER_ROLE}")
-            for t in TABLES:
-                cur.execute(f"GRANT SELECT ON {t} TO {READER_ROLE}")
+            for t in TABLES:  # only grant what's missing: GRANT waits on table locks
+                cur.execute("SELECT has_table_privilege(%s, %s, 'SELECT')", (READER_ROLE, t))
+                if not cur.fetchone()[0]:
+                    cur.execute(f"GRANT SELECT ON {t} TO {READER_ROLE}")
             cur.execute(f"ALTER ROLE {READER_ROLE} SET default_transaction_read_only = on")
             cur.execute(f"ALTER ROLE {READER_ROLE} SET statement_timeout = '60s'")
 
@@ -98,13 +101,20 @@ _reader_ready = False
 
 
 def _reader_conn():
+    """Connect as the read-only login. Setup normally ran at startup; if the login
+    doesn't work yet (first boot), set it up once and retry."""
     global _reader_ready
-    if not _reader_ready:
+    params = conninfo_to_dict(DATABASE_URL)
+    params.update(user=READER_ROLE, password=READER_PASSWORD, connect_timeout=10)
+    info = make_conninfo(**params)
+    try:
+        return psycopg.connect(info, autocommit=False)
+    except psycopg.OperationalError:
+        if _reader_ready:
+            raise
         ensure_reader()
         _reader_ready = True
-    params = conninfo_to_dict(DATABASE_URL)
-    params.update(user=READER_ROLE, password=READER_PASSWORD)
-    return psycopg.connect(make_conninfo(**params), autocommit=False)
+        return psycopg.connect(info, autocommit=False)
 
 
 def _jsonable(v):
