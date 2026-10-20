@@ -209,17 +209,32 @@ def _convert(table: str, col: str, v: str):
 
 # ---------------------------------------------------------------- SP-API ----
 
-def _with_retry(fn, *args, tries: int = 6):
-    """createReport is throttled hard (burst 15, then ~1/min). Back off on 429."""
-    for i in range(tries):
+QUOTA_BACKOFF_S = 600          # wait 10 min when Amazon says QuotaExceeded
+QUOTA_GIVE_UP_S = 6 * 3600     # keep trying for up to 6 hours
+MIN_GAP_BETWEEN_REPORTS_S = 180  # pace report requests; the quota is shared with other automations
+_last_create = [0.0]
+
+
+def _with_retry(fn, *args):
+    """Patient wrapper for createReport.
+
+    Amazon's report-request quota is shared by every automation on the account and
+    can take a long time to refill, so: space requests out, and on 429 back off in
+    10-minute steps (for hours if needed) instead of failing.
+    """
+    deadline = time.time() + QUOTA_GIVE_UP_S
+    while True:
+        gap = _last_create[0] + MIN_GAP_BETWEEN_REPORTS_S - time.time()
+        if gap > 0:
+            time.sleep(gap)
         try:
+            _last_create[0] = time.time()
             return fn(*args)
         except requests.HTTPError as e:
             code = e.response.status_code if e.response is not None else None
-            if code in (429, 500, 503) and i < tries - 1:
-                wait = min(60 * (i + 1), 300)
-                _set_step(f"Amazon said {code} creating report; retrying in {wait}s ({e})"[:300])
-                time.sleep(wait)
+            if code in (429, 500, 503) and time.time() < deadline:
+                _set_step(f"Amazon said {code} (quota/temporary); waiting {QUOTA_BACKOFF_S // 60} min before retrying")
+                time.sleep(QUOTA_BACKOFF_S)
                 continue
             raise
 
