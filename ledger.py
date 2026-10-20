@@ -24,6 +24,9 @@ Routes:
 
 from __future__ import annotations
 
+import csv
+import gzip
+import io
 import json
 import os
 import re
@@ -46,7 +49,7 @@ SUMMARY_REPORT = "GET_LEDGER_SUMMARY_VIEW_DATA"
 
 BACKFILL_DAYS = 540          # Amazon keeps ~18 months of ledger history
 DAILY_LOOKBACK_DAYS = 10     # re-pull recent days to catch Amazon's revisions
-CHUNK_DAYS = 30              # one report request per 30-day window
+CHUNK_DAYS = 7               # one report request per 7-day window (keeps memory low)
 
 _run_lock = threading.Lock()
 
@@ -134,6 +137,13 @@ def _ensure_base_tables(conn):
                 loaded_at timestamptz NOT NULL DEFAULT now()
             );
             CREATE INDEX IF NOT EXISTS ledger_summary_month_idx ON ledger_summary (period_month);
+            CREATE TABLE IF NOT EXISTS ledger_loaded_windows (
+                report text NOT NULL,
+                start_date date NOT NULL,
+                end_date date NOT NULL,
+                rows bigint,
+                loaded_at timestamptz NOT NULL DEFAULT now()
+            );
             CREATE TABLE IF NOT EXISTS ledger_sync_runs (
                 id bigserial PRIMARY KEY,
                 mode text,
@@ -212,24 +222,59 @@ def _create_report(token: str, report_type: str, start: date, end: date, options
     return r.json()["reportId"]
 
 
-def _fetch_rows(report_type: str, start: date, end: date, options: dict | None = None) -> list[dict]:
+def _iter_report_rows(report_type: str, start: date, end: date, options: dict | None = None):
+    """Yield one dict per report line, streamed straight from Amazon's file.
+
+    Nothing holds the whole report in memory: the download is decompressed and
+    parsed line by line, so a big window can't blow the instance's RAM.
+    """
     import main
     token = main.lwa_token()
     report_id = _with_retry(_create_report, token, report_type, start, end, options)
     doc_id = main.poll_report(token, report_id, timeout_s=1800)
     if not doc_id:
-        return []  # CANCELLED = no data in window
+        return  # CANCELLED = no data in window
     token = main.lwa_token()  # tokens last 1h; refresh before download
-    text = main.download_report(token, doc_id)
-    return main.parse_tsv(text)
+    meta = requests.get(f"{main.SPAPI_ENDPOINT}/reports/2021-06-30/documents/{doc_id}",
+                        headers={"x-amz-access-token": token}, timeout=30)
+    meta.raise_for_status()
+    meta = meta.json()
+    with requests.get(meta["url"], stream=True, timeout=300) as resp:
+        resp.raise_for_status()
+        raw = resp.raw
+        if meta.get("compressionAlgorithm") == "GZIP":
+            raw = gzip.GzipFile(fileobj=raw)
+        text = io.TextIOWrapper(raw, encoding="utf-8", errors="replace", newline="")
+        for row in csv.DictReader(text, delimiter="\t"):
+            yield {(k or "").strip().lower(): (v or "").strip() for k, v in row.items()}
 
 
-# ------------------------------------------------------------------ loads ---
+BATCH = 1000
 
-def _load_detail_window(conn, start: date, end: date) -> int:
-    rows = _fetch_rows(DETAIL_REPORT, start, end)
-    norm = []
-    for raw in rows:
+
+def _insert_stream(conn, table: str, rows, fixed: dict) -> int:
+    """Insert mapped rows in batches. `fixed` = extra constant columns."""
+    n, cols, batch, cur = 0, None, [], conn.cursor()
+    sql = None
+    for r in rows:
+        if cols is None:
+            cols = list(fixed) + sorted(c for c in r if c not in fixed)
+            _ensure_columns(conn, table, cols)
+            sql = (f"INSERT INTO {table} (" + ", ".join(f'"{c}"' for c in cols) +
+                   ") VALUES (" + ", ".join(["%s"] * len(cols)) + ")")
+        batch.append([fixed[c] if c in fixed else _convert(table, c, r.get(c, "")) for c in cols])
+        if len(batch) >= BATCH:
+            cur.executemany(sql, batch)
+            n += len(batch)
+            batch = []
+    if batch:
+        cur.executemany(sql, batch)
+        n += len(batch)
+    return n
+
+
+def _detail_rows(start: date, end: date):
+    for raw in _iter_report_rows(DETAIL_REPORT, start, end):
         r = {}
         for k, v in raw.items():
             c = _col(k)
@@ -241,50 +286,44 @@ def _load_detail_window(conn, start: date, end: date) -> int:
         d = _parse_date(r.get("event_date", ""))
         if d is None or d < start or d > end:
             continue  # adjacent window owns it
-        norm.append(r)
+        yield r
 
-    cols = sorted({c for r in norm for c in r} | {"event_date"})
+
+def _load_detail_window(conn, start: date, end: date) -> int:
     with conn.transaction():
-        _ensure_columns(conn, "ledger_detail", cols)
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM ledger_detail WHERE event_date BETWEEN %s AND %s", (start, end))
-            if norm:
-                col_sql = ", ".join(f'"{c}"' for c in cols)
-                ph = ", ".join(["%s"] * len(cols))
-                cur.executemany(
-                    f"INSERT INTO ledger_detail ({col_sql}) VALUES ({ph})",
-                    [[_convert("ledger_detail", c, r.get(c, "")) for c in cols] for r in norm],
-                )
-    return len(norm)
+        conn.execute("DELETE FROM ledger_detail WHERE event_date BETWEEN %s AND %s", (start, end))
+        n = _insert_stream(conn, "ledger_detail", _detail_rows(start, end), {})
+        _mark_loaded(conn, "detail", start, end, n)
+    return n
+
+
+def _summary_rows(month_start: date, month_end: date):
+    opts = {"aggregateByLocation": "COUNTRY", "aggregatedByTimePeriod": "MONTHLY"}
+    for raw in _iter_report_rows(SUMMARY_REPORT, month_start, month_end, opts):
+        yield {("report_date_label" if _col(k) == "date" else _col(k)): v for k, v in raw.items()}
 
 
 def _load_summary_month(conn, month_start: date, month_end: date) -> int:
-    rows = _fetch_rows(SUMMARY_REPORT, month_start, month_end,
-                       {"aggregateByLocation": "COUNTRY", "aggregatedByTimePeriod": "MONTHLY"})
-    norm = []
-    for raw in rows:
-        r = {}
-        for k, v in raw.items():
-            c = _col(k)
-            if c == "date":
-                c = "report_date_label"   # Amazon's own period label, kept as text
-            r[c] = v
-        norm.append(r)
-
-    cols = sorted({c for r in norm for c in r})
     with conn.transaction():
-        _ensure_columns(conn, "ledger_summary", cols)
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM ledger_summary WHERE period_month = %s", (month_start,))
-            if norm:
-                all_cols = ["period_month"] + cols
-                col_sql = ", ".join(f'"{c}"' for c in all_cols)
-                ph = ", ".join(["%s"] * len(all_cols))
-                cur.executemany(
-                    f"INSERT INTO ledger_summary ({col_sql}) VALUES ({ph})",
-                    [[month_start] + [_convert("ledger_summary", c, r.get(c, "")) for c in cols] for r in norm],
-                )
-    return len(norm)
+        conn.execute("DELETE FROM ledger_summary WHERE period_month = %s", (month_start,))
+        n = _insert_stream(conn, "ledger_summary", _summary_rows(month_start, month_end),
+                           {"period_month": month_start})
+        _mark_loaded(conn, "summary", month_start, month_end, n)
+    return n
+
+
+def _mark_loaded(conn, report: str, start: date, end: date, n: int):
+    conn.execute("""INSERT INTO ledger_loaded_windows (report, start_date, end_date, rows, loaded_at)
+                    VALUES (%s, %s, %s, %s, now())""", (report, start, end, n))
+
+
+def _already_loaded(conn, report: str, start: date, end: date) -> bool:
+    """True if a past run loaded a window covering [start, end] (used to resume backfills)."""
+    with conn.cursor() as cur:
+        cur.execute("""SELECT 1 FROM ledger_loaded_windows
+                       WHERE report = %s AND start_date <= %s AND end_date >= %s LIMIT 1""",
+                    (report, start, end))
+        return cur.fetchone() is not None
 
 
 def _windows(start: date, end: date, size: int):
@@ -321,11 +360,15 @@ def run_sync(mode: str = "daily") -> dict:
     try:
         # newest first, so recent data is usable while a backfill is still running
         for s, e in reversed(list(_windows(detail_start, yesterday, CHUNK_DAYS))):
+            if mode == "backfill" and _already_loaded(conn, "detail", s, e):
+                continue  # resume: an earlier (interrupted) run already loaded this
             n = _load_detail_window(conn, s, e)
             detail_total += n
             done.append({"report": "detail", "start": str(s), "end": str(e), "rows": n})
             _progress(conn, run_id, done, detail_total, summary_total)
         for s, e in reversed(list(_months(summary_start, yesterday))):
+            if mode == "backfill" and e < yesterday and _already_loaded(conn, "summary", s, e):
+                continue
             n = _load_summary_month(conn, s, e)
             summary_total += n
             done.append({"report": "summary", "start": str(s), "end": str(e), "rows": n})
@@ -411,6 +454,14 @@ def maybe_start_backfill():
             done = cur.fetchone()[0]
         conn.close()
         print(f"ledger: database reachable; completed backfills = {done}")
+        with _db() as c2:
+            c2.execute("UPDATE ledger_sync_runs SET status='interrupted', finished_at=now() "
+                       "WHERE status='running'")
+            # One-time: record windows loaded by runs from before window tracking existed.
+            c2.execute("""INSERT INTO ledger_loaded_windows (report, start_date, end_date, rows)
+                SELECT DISTINCT w->>'report', (w->>'start')::date, (w->>'end')::date, (w->>'rows')::bigint
+                FROM ledger_sync_runs r, jsonb_array_elements(r.windows) w
+                WHERE NOT EXISTS (SELECT 1 FROM ledger_loaded_windows)""")
         if done == 0 and _run_lock.acquire(blocking=False):
             threading.Thread(target=_run_in_background, args=("backfill",), daemon=True).start()
             print("ledger: backfill started")
