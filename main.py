@@ -300,6 +300,13 @@ try:
 except Exception as _mcp_exc:  # pragma: no cover
     print(f"ledger connector not mounted: {type(_mcp_exc).__name__}: {_mcp_exc}")
 
+# Manual upload of Seller Central ledger exports (see ledger_import.py).
+try:
+    from ledger_import import router as ledger_import_router
+    app.include_router(ledger_import_router)
+except Exception as _imp_exc:  # pragma: no cover
+    print(f"ledger import not mounted: {type(_imp_exc).__name__}: {_imp_exc}")
+
 
 @app.head("/")
 @app.get("/", response_class=HTMLResponse)
