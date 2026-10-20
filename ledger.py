@@ -478,6 +478,10 @@ def trigger(mode: str = Query("daily", pattern="^(daily|backfill)$"),
             x_sync_token: str = Header("")):
     if not LEDGER_SYNC_TOKEN or x_sync_token != LEDGER_SYNC_TOKEN:
         raise HTTPException(401, "bad or missing X-Sync-Token")
+    if os.environ.get("LEDGER_PAUSED") == "1":
+        # Amazon caps ledger report pulls per day (shared with Seller Central downloads
+        # and third-party apps), so syncing can be switched off without a code change.
+        return {"started": False, "reason": "ledger sync is paused (LEDGER_PAUSED=1)"}
     if not _run_lock.acquire(blocking=False):
         return {"started": False, "reason": "a ledger sync is already running"}
     threading.Thread(target=_run_in_background, args=(mode,), daemon=True).start()
@@ -509,7 +513,8 @@ def status():
 def maybe_start_backfill():
     """On boot: if LEDGER_BACKFILL_ON_START=1 and no backfill has finished OK yet,
     start one in the background. Safe to repeat - loads are idempotent."""
-    if os.environ.get("LEDGER_BACKFILL_ON_START") != "1" or not DATABASE_URL:
+    if (os.environ.get("LEDGER_BACKFILL_ON_START") != "1" or os.environ.get("LEDGER_PAUSED") == "1"
+            or not DATABASE_URL):
         return
     try:
         conn = _db()
