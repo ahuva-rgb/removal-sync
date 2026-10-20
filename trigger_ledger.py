@@ -8,7 +8,7 @@ import sys
 import requests
 
 url = os.environ.get("REMOVAL_SYNC_URL", "https://removal-sync.onrender.com").rstrip("/")
-mode = os.environ.get("LEDGER_MODE", "daily")
+mode = os.environ.get("LEDGER_MODE", "auto")
 r = requests.post(f"{url}/ledger/sync", params={"mode": mode},
                   headers={"X-Sync-Token": os.environ["LEDGER_SYNC_TOKEN"]}, timeout=120)
 print(r.status_code, r.text)

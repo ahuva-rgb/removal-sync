@@ -209,34 +209,22 @@ def _convert(table: str, col: str, v: str):
 
 # ---------------------------------------------------------------- SP-API ----
 
-QUOTA_BACKOFF_S = 600          # wait 10 min when Amazon says QuotaExceeded
-QUOTA_GIVE_UP_S = 6 * 3600     # keep trying for up to 6 hours
-MIN_GAP_BETWEEN_REPORTS_S = 180  # pace report requests; the quota is shared with other automations
-_last_create = [0.0]
+class AmazonLimitReached(RuntimeError):
+    """Amazon refused the request (daily/quota limit). We stop instead of retrying:
+    the ledger report's daily limit is shared with Seller Central downloads and
+    third-party apps, so hammering it would block everyone."""
 
 
 def _with_retry(fn, *args):
-    """Patient wrapper for createReport.
-
-    Amazon's report-request quota is shared by every automation on the account and
-    can take a long time to refill, so: space requests out, and on 429 back off in
-    10-minute steps (for hours if needed) instead of failing.
-    """
-    deadline = time.time() + QUOTA_GIVE_UP_S
-    while True:
-        gap = _last_create[0] + MIN_GAP_BETWEEN_REPORTS_S - time.time()
-        if gap > 0:
-            time.sleep(gap)
-        try:
-            _last_create[0] = time.time()
-            return fn(*args)
-        except requests.HTTPError as e:
-            code = e.response.status_code if e.response is not None else None
-            if code in (429, 500, 503) and time.time() < deadline:
-                _set_step(f"Amazon said {code} (quota/temporary); waiting {QUOTA_BACKOFF_S // 60} min before retrying")
-                time.sleep(QUOTA_BACKOFF_S)
-                continue
-            raise
+    """Make exactly one request. On 429/quota, stop the run - never loop."""
+    try:
+        return fn(*args)
+    except requests.HTTPError as e:
+        code = e.response.status_code if e.response is not None else None
+        if code == 429:
+            _set_step("Amazon limit reached - stopping without retrying")
+            raise AmazonLimitReached(str(e)[:300]) from None
+        raise
 
 
 def _create_report(token: str, report_type: str, start: date, end: date, options: dict | None):
@@ -407,41 +395,95 @@ def _months(start: date, end: date):
         m = nxt
 
 
-def run_sync(mode: str = "daily") -> dict:
-    yesterday = datetime.now(timezone.utc).date() - timedelta(days=1)
-    back = BACKFILL_DAYS if mode == "backfill" else DAILY_LOOKBACK_DAYS
-    detail_start = yesterday - timedelta(days=back - 1)
-    summary_start = (yesterday - timedelta(days=back - 1)) if mode == "backfill" \
-        else date(yesterday.year, yesterday.month, 1) - timedelta(days=1)  # also prior month
+def _missing_ranges(conn, start: date, end: date) -> list[tuple[date, date]]:
+    """Date ranges in [start, end] not yet loaded into ledger_detail (by any run or upload)."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT start_date, end_date FROM ledger_loaded_windows WHERE report = 'detail'")
+        covered = cur.fetchall()
+    gaps, cur_start, d = [], None, start
+    while d <= end:
+        hit = any(a <= d <= b for a, b in covered)
+        if not hit and cur_start is None:
+            cur_start = d
+        if hit and cur_start is not None:
+            gaps.append((cur_start, d - timedelta(days=1)))
+            cur_start = None
+        d += timedelta(days=1)
+    if cur_start is not None:
+        gaps.append((cur_start, end))
+    return gaps
 
+
+FALLBACK_CHUNK_DAYS = 90  # only if Amazon won't build one report for a whole gap
+
+
+def _load_range_few_requests(conn, s: date, e: date, done: list) -> int:
+    """Load [s, e] with ONE report; only if Amazon rejects it, split into 90-day pieces."""
+    from fastapi import HTTPException
+    try:
+        n = _load_detail_window(conn, s, e)
+        done.append({"report": "detail", "start": str(s), "end": str(e), "rows": n})
+        return n
+    except HTTPException as exc:  # report FATAL - most likely range too large
+        if (e - s).days < FALLBACK_CHUNK_DAYS:
+            raise
+        _set_step(f"Amazon couldn't build {s}..{e} in one report ({exc.detail[:120]}); splitting")
+    total = 0
+    for cs, ce in reversed(list(_windows(s, e, FALLBACK_CHUNK_DAYS))):
+        n = _load_detail_window(conn, cs, ce)
+        done.append({"report": "detail", "start": str(cs), "end": str(ce), "rows": n})
+        total += n
+    return total
+
+
+def _has_completed_backfill(conn) -> bool:
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM ledger_sync_runs WHERE mode = 'backfill' AND status = 'ok' LIMIT 1")
+        return cur.fetchone() is not None
+
+
+def run_sync(mode: str = "auto") -> dict:
+    """
+    auto     - backfill if one has never finished, otherwise the daily update
+    backfill - fill every missing date in the last ~18 months, one report per gap
+    daily    - ONE report: the last 10 days (re-pulled to catch Amazon's revisions);
+               plus the monthly summary for last month, on the 2nd of each month only
+    """
+    yesterday = datetime.now(timezone.utc).date() - timedelta(days=1)
     conn = _db()
     _ensure_base_tables(conn)
+    if mode == "auto":
+        mode = "daily" if _has_completed_backfill(conn) else "backfill"
     with conn.cursor() as cur:
         cur.execute("INSERT INTO ledger_sync_runs (mode, status) VALUES (%s, 'running') RETURNING id", (mode,))
         run_id = cur.fetchone()[0]
-    conn.commit()
 
     done, detail_total, summary_total = [], 0, 0
     try:
-        # newest first, so recent data is usable while a backfill is still running
-        for s, e in reversed(list(_windows(detail_start, yesterday, CHUNK_DAYS))):
-            if mode == "backfill" and _already_loaded(conn, "detail", s, e):
-                continue  # resume: an earlier (interrupted) run already loaded this
-            n = _load_detail_window(conn, s, e)
-            detail_total += n
-            done.append({"report": "detail", "start": str(s), "end": str(e), "rows": n})
+        if mode == "backfill":
+            earliest = yesterday - timedelta(days=BACKFILL_DAYS - 1)
+            for s, e in reversed(_missing_ranges(conn, earliest, yesterday)):
+                detail_total += _load_range_few_requests(conn, s, e, done)
+                _progress(conn, run_id, done, detail_total, summary_total)
+        else:
+            s = yesterday - timedelta(days=DAILY_LOOKBACK_DAYS - 1)
+            detail_total += _load_detail_window(conn, s, yesterday)
+            done.append({"report": "detail", "start": str(s), "end": str(yesterday), "rows": detail_total})
             _progress(conn, run_id, done, detail_total, summary_total)
-        for s, e in reversed(list(_months(summary_start, yesterday))):
-            if mode == "backfill" and e < yesterday and _already_loaded(conn, "summary", s, e):
-                continue
-            n = _load_summary_month(conn, s, e)
-            summary_total += n
-            done.append({"report": "summary", "start": str(s), "end": str(e), "rows": n})
-            _progress(conn, run_id, done, detail_total, summary_total)
+            today = datetime.now(timezone.utc).date()
+            if today.day == 2:
+                last_month_end = date(today.year, today.month, 1) - timedelta(days=1)
+                ms = date(last_month_end.year, last_month_end.month, 1)
+                summary_total += _load_summary_month(conn, ms, last_month_end)
+                done.append({"report": "summary", "start": str(ms), "end": str(last_month_end), "rows": summary_total})
+                _progress(conn, run_id, done, detail_total, summary_total)
         _finish(conn, run_id, "ok", None)
-        return {"run_id": run_id, "detail_rows": detail_total, "summary_rows": summary_total}
+        return {"run_id": run_id, "mode": mode, "detail_rows": detail_total, "summary_rows": summary_total}
+    except AmazonLimitReached as exc:
+        _finish(conn, run_id, "stopped_amazon_limit",
+                "Amazon's daily limit for this report was reached; no retries. " + str(exc))
+        raise
     except Exception as exc:
-        conn.rollback()
         _finish(conn, run_id, "error", f"{type(exc).__name__}: {exc}\n{traceback.format_exc()[-1500:]}")
         raise
     finally:
@@ -474,7 +516,7 @@ def _run_in_background(mode: str):
 # ----------------------------------------------------------------- routes ---
 
 @router.post("/sync")
-def trigger(mode: str = Query("daily", pattern="^(daily|backfill)$"),
+def trigger(mode: str = Query("auto", pattern="^(auto|daily|backfill)$"),
             x_sync_token: str = Header("")):
     if not LEDGER_SYNC_TOKEN or x_sync_token != LEDGER_SYNC_TOKEN:
         raise HTTPException(401, "bad or missing X-Sync-Token")
@@ -538,7 +580,7 @@ def maybe_start_backfill():
                 SELECT DISTINCT w->>'report', (w->>'start')::date, (w->>'end')::date, (w->>'rows')::bigint
                 FROM ledger_sync_runs r, jsonb_array_elements(r.windows) w
                 WHERE NOT EXISTS (SELECT 1 FROM ledger_loaded_windows)""")
-        if done == 0 and _run_lock.acquire(blocking=False):
+        if False and done == 0 and _run_lock.acquire(blocking=False):  # boot never requests reports now
             threading.Thread(target=_run_in_background, args=("backfill",), daemon=True).start()
             print("ledger: backfill started")
     except Exception as exc:
