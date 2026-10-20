@@ -52,6 +52,13 @@ DAILY_LOOKBACK_DAYS = 10     # re-pull recent days to catch Amazon's revisions
 CHUNK_DAYS = 7               # one report request per 7-day window (keeps memory low)
 
 _run_lock = threading.Lock()
+_step = {"what": "idle", "since": None}
+
+
+def _set_step(what: str):
+    _step["what"] = what
+    _step["since"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    print(f"ledger: {what}", flush=True)
 
 # Report columns that hold quantities -> stored as integers.
 _INT_HINTS = ("quantity", "balance", "receipts", "shipments", "returns",
@@ -210,7 +217,9 @@ def _with_retry(fn, *args, tries: int = 6):
         except requests.HTTPError as e:
             code = e.response.status_code if e.response is not None else None
             if code in (429, 500, 503) and i < tries - 1:
-                time.sleep(min(60 * (i + 1), 300))
+                wait = min(60 * (i + 1), 300)
+                _set_step(f"Amazon said {code} creating report; retrying in {wait}s ({e})"[:300])
+                time.sleep(wait)
                 continue
             raise
 
@@ -245,8 +254,11 @@ def _download_report(report_type: str, start: date, end: date, options: dict | N
     import main
     import tempfile
     token = main.lwa_token()
+    _set_step(f"requesting {report_type} {start}..{end}")
     report_id = _with_retry(_create_report, token, report_type, start, end, options)
+    _set_step(f"waiting for Amazon to build report {report_id} ({start}..{end})")
     doc_id = main.poll_report(token, report_id, timeout_s=1800)
+    _set_step(f"report {report_id} ready ({'has data' if doc_id else 'no data'}); downloading")
     if not doc_id:
         return None  # CANCELLED = no data in window
     token = main.lwa_token()  # tokens last 1h; refresh before download
@@ -471,7 +483,7 @@ def status():
                     for r in cur.fetchall()]
             cur.execute("SELECT count(*), min(event_date), max(event_date) FROM ledger_detail")
             n, lo, hi = cur.fetchone()
-        return {"running": _run_lock.locked(), "ledger_detail": {"rows": n, "from": str(lo), "to": str(hi)},
+        return {"running": _run_lock.locked(), "current_step": _step, "ledger_detail": {"rows": n, "from": str(lo), "to": str(hi)},
                 "recent_runs": runs}
     finally:
         conn.close()
