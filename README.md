@@ -59,3 +59,9 @@ be queried from chat.
 - Env vars on this service: `DATABASE_URL` (internal URL of amazon-ledger-db), `LEDGER_SYNC_TOKEN`.
 - Triggered daily by the `ledger-sync-daily` cron job (`trigger_ledger.py`).
 - `GET /ledger/status` shows recent runs and row counts.
+
+## Ledger connector for Claude (`mcp_ledger.py`)
+Read-only MCP endpoint at `/mcp/<MCP_PATH_TOKEN>` with two tools: `describe_ledger` and
+`query_ledger`. Queries run as the `ledger_reader` Postgres login (SELECT on the three ledger
+tables only, read-only transaction, 60s timeout). Env vars: `LEDGER_READER_PASSWORD`, `MCP_PATH_TOKEN`.
+Added once as a custom connector in the Claude organization so everyone there can use it.

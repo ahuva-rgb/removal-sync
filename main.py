@@ -293,6 +293,13 @@ try:
 except Exception as _ledger_exc:  # pragma: no cover
     print(f"ledger router not mounted: {type(_ledger_exc).__name__}: {_ledger_exc}")
 
+# Read-only "Ledger" connector for Claude (see mcp_ledger.py).
+try:
+    from mcp_ledger import router as mcp_ledger_router
+    app.include_router(mcp_ledger_router)
+except Exception as _mcp_exc:  # pragma: no cover
+    print(f"ledger connector not mounted: {type(_mcp_exc).__name__}: {_mcp_exc}")
+
 
 @app.head("/")
 @app.get("/", response_class=HTMLResponse)
