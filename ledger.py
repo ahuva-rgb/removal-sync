@@ -125,7 +125,17 @@ def _db():
 _SETUP_LOCK = threading.Lock()
 
 
+_BASE_OBJECTS = ("ledger_detail", "ledger_detail_date_idx", "ledger_summary",
+                 "ledger_summary_month_idx", "ledger_loaded_windows", "ledger_sync_runs")
+
+
 def _ensure_base_tables(conn):
+    # Check first: even "IF NOT EXISTS" DDL waits for table locks during a load.
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM unnest(%s::text[]) n WHERE to_regclass(n) IS NULL",
+                    (list(_BASE_OBJECTS),))
+        if cur.fetchone()[0] == 0:
+            return
     with _SETUP_LOCK, conn.cursor() as cur:
         cur.execute("SET lock_timeout = '10s'")
         cur.execute("""
