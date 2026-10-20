@@ -286,6 +286,13 @@ try:
 except Exception as _dedupe_exc:  # pragma: no cover
     print(f"dedupe router not mounted: {type(_dedupe_exc).__name__}: {_dedupe_exc}")
 
+# Inventory Ledger -> Postgres sync (see ledger.py). Same isolation as dedupe.
+try:
+    from ledger import router as ledger_router
+    app.include_router(ledger_router)
+except Exception as _ledger_exc:  # pragma: no cover
+    print(f"ledger router not mounted: {type(_ledger_exc).__name__}: {_ledger_exc}")
+
 
 @app.head("/")
 @app.get("/", response_class=HTMLResponse)

@@ -42,3 +42,20 @@ property names above must match exactly, and a "Key" title property must exist
 - CANCELLED report = no data in range = treated as empty, not an error.
 - Notion writes throttled ~3/s. Dedupe scan is fast (100 rows/page).
 - Overlap your windows generously (e.g. 60 days) — dedupe makes re-pulls free.
+
+---
+
+# Inventory Ledger → Postgres (`ledger.py`)
+
+Pulls `GET_LEDGER_DETAIL_VIEW_DATA` (every event) and `GET_LEDGER_SUMMARY_VIEW_DATA`
+(monthly, country level) into the `amazon-ledger-db` Render Postgres so the ledger can
+be queried from chat.
+
+- Tables: `ledger_detail` (one row per event, `event_date`), `ledger_summary`
+  (`period_month`), `ledger_sync_runs` (run log).
+- Each window is deleted and re-inserted in one transaction, so re-runs never duplicate.
+- Daily mode re-pulls the last 10 days (catches Amazon revisions) plus this and last month's summary.
+- Backfill mode pulls ~18 months, newest first.
+- Env vars on this service: `DATABASE_URL` (internal URL of amazon-ledger-db), `LEDGER_SYNC_TOKEN`.
+- Triggered daily by the `ledger-sync-daily` cron job (`trigger_ledger.py`).
+- `GET /ledger/status` shows recent runs and row counts.
