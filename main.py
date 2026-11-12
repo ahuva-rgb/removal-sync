@@ -293,6 +293,13 @@ try:
 except Exception as _ledger_exc:  # pragma: no cover
     print(f"ledger router not mounted: {type(_ledger_exc).__name__}: {_ledger_exc}")
 
+# Reimbursements + customer returns -> Postgres (see claims_data.py). Same isolation.
+try:
+    from claims_data import router as claims_data_router
+    app.include_router(claims_data_router)
+except Exception as _claims_exc:  # pragma: no cover
+    print(f"claims data router not mounted: {type(_claims_exc).__name__}: {_claims_exc}")
+
 # Read-only "Ledger" connector for Claude (see mcp_ledger.py).
 try:
     from mcp_ledger import router as mcp_ledger_router
