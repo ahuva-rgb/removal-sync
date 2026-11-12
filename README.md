@@ -65,3 +65,25 @@ Read-only MCP endpoint at `/mcp/<MCP_PATH_TOKEN>` with two tools: `describe_ledg
 `query_ledger`. Queries run as the `ledger_reader` Postgres login (SELECT on the three ledger
 tables only, read-only transaction, 60s timeout). Env vars: `LEDGER_READER_PASSWORD`, `MCP_PATH_TOKEN`.
 Added once as a custom connector in the Claude organization so everyone there can use it.
+
+---
+
+# Reimbursements + Customer Returns → Postgres (`claims_data.py`)
+
+Pulls `GET_FBA_REIMBURSEMENTS_DATA` and `GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA` into the same
+`amazon-ledger-db` database, so the reimbursement checks can see what Amazon already paid and which
+refunded units actually came back. Both reports need only the Amazon Fulfillment role.
+
+- Tables: `fba_reimbursements` (`approval_date`, `approval_ts`), `fba_customer_returns`
+  (`return_date`, `return_ts`), `claims_sync_runs` (run log).
+- Rows are replaced by the exact timestamp range of each downloaded file, in one transaction, so
+  re-runs never duplicate and never drop a neighbouring window's rows.
+- The returns report's `customer-comments` column (buyer free text) is not stored.
+- Daily mode re-pulls the last 30 days of each report (2 report requests). Backfill fills ~18 months
+  in 60-day windows, newest first, pausing between requests; it resumes where it stopped.
+- A 429 from Amazon stops the run without retrying, same as the ledger.
+- Triggered by the existing `ledger-sync-daily` cron job: `trigger_ledger.py` now calls
+  `/ledger/sync` and then `/claims/sync`. No new Render service is needed.
+- Switches: `CLAIMS_PAUSED=1` on the service turns it off; `CLAIMS_SYNC=0` on the cron job skips the call.
+- `GET /claims/status` shows row counts, date coverage and recent runs.
+- The Claude ledger connector (`mcp_ledger.py`) lists and can query the two new tables once they exist.

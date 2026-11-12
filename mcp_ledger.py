@@ -33,6 +33,9 @@ MCP_PATH_TOKEN = os.environ.get("MCP_PATH_TOKEN", "")
 
 READER_ROLE = "ledger_reader"
 TABLES = ("ledger_detail", "ledger_summary", "ledger_sync_runs", "ledger_loaded_windows")
+# Filled by claims_data.py; described only once they exist and the reader login can read them.
+EXTRA_TABLES = ("fba_reimbursements", "fba_customer_returns", "claims_sync_runs")
+EXTRA_DATE_COLS = {"fba_reimbursements": "approval_date", "fba_customer_returns": "return_date"}
 MAX_ROWS = 2000
 SUPPORTED_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 
@@ -43,6 +46,12 @@ Call describe_ledger first to see the exact columns and date coverage, then quer
   event_type values look like Shipments, CustomerReturns, Adjustments, Receipts, WhseTransfers, VendorReturns.
 - ledger_summary: monthly balances per FNSKU/disposition (period_month = first day of the month).
 - ledger_sync_runs: when the data was last refreshed.
+- fba_reimbursements: one row per line of Amazon's Reimbursements report (approval_date, reimbursement_id,
+  case_id, amazon_order_id, reason, sku, fnsku, asin, condition, amount_per_unit, amount_total,
+  quantity_reimbursed_cash / _inventory / _total, original_reimbursement_id, original_reimbursement_type).
+- fba_customer_returns: one row per line of the FBA Customer Returns report (return_date, order_id, sku, fnsku,
+  asin, quantity, fulfillment_center_id, detailed_disposition, reason, status, license_plate_number).
+- claims_sync_runs: when those two were last refreshed.
 Aggregate in SQL rather than pulling raw rows; results are capped at 2000 rows."""
 
 TOOLS = [
@@ -57,7 +66,8 @@ TOOLS = [
     {
         "name": "query_ledger",
         "description": "Run one read-only PostgreSQL SELECT against the ledger tables "
-                       "(ledger_detail, ledger_summary, ledger_sync_runs). Returns up to 2000 rows as JSON. "
+                       "(ledger_detail, ledger_summary, ledger_sync_runs) and, once synced, "
+                       "fba_reimbursements and fba_customer_returns. Returns up to 2000 rows as JSON. "
                        "Writes are impossible (read-only login, read-only transaction, 60s timeout).",
         "inputSchema": {
             "type": "object",
@@ -169,6 +179,31 @@ def describe() -> dict:
                     info["month_coverage"] = [str(lo), str(hi)]
                 if t == "ledger_sync_runs":
                     cur.execute("""SELECT mode, status, started_at, finished_at FROM ledger_sync_runs
+                                   ORDER BY id DESC LIMIT 3""")
+                    info["recent_runs"] = [[_jsonable(v) for v in r] for r in cur.fetchall()]
+                out[t] = info
+            for t in EXTRA_TABLES:  # optional tables: skip quietly if not created/granted yet
+                cur.execute("SELECT to_regclass(%s) IS NOT NULL", (t,))
+                if not cur.fetchone()[0]:
+                    continue
+                cur.execute("SELECT has_table_privilege(current_user, %s, 'SELECT')", (t,))
+                if not cur.fetchone()[0]:
+                    continue
+                cur.execute("""SELECT column_name, data_type FROM information_schema.columns
+                               WHERE table_name = %s ORDER BY ordinal_position""", (t,))
+                cols = {c: ty for c, ty in cur.fetchall()}
+                cur.execute(f"SELECT count(*) FROM {t}")
+                info = {"columns": cols, "rows": cur.fetchone()[0]}
+                d = EXTRA_DATE_COLS.get(t)
+                if d and info["rows"]:
+                    cur.execute(f"SELECT min({d}), max({d}) FROM {t}")
+                    lo, hi = cur.fetchone()
+                    info["date_coverage"] = [str(lo), str(hi)]
+                    if "reason" in cols and t == "fba_reimbursements":
+                        cur.execute(f"SELECT reason, count(*) FROM {t} GROUP BY 1 ORDER BY 2 DESC")
+                        info["reason_values"] = {str(k): n for k, n in cur.fetchall()}
+                if t == "claims_sync_runs":
+                    cur.execute("""SELECT mode, status, started_at, finished_at FROM claims_sync_runs
                                    ORDER BY id DESC LIMIT 3""")
                     info["recent_runs"] = [[_jsonable(v) for v in r] for r in cur.fetchall()]
                 out[t] = info
