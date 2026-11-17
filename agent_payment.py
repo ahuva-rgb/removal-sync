@@ -164,7 +164,8 @@ def steps_version(c: dict, uploads: dict) -> str:
 # ------------------------------------------------------------------ Notion ---
 
 def _notion_headers():
-    token = os.environ.get("NOTION_TOKEN", "")
+    # PAYMENT_NOTION_TOKEN lets this agent use its own read-only Notion connection; otherwise the service's one.
+    token = os.environ.get("PAYMENT_NOTION_TOKEN") or os.environ.get("NOTION_TOKEN", "")
     if not token:
         raise RuntimeError("NOTION_TOKEN is not set")
     return {"Authorization": f"Bearer {token}", "Notion-Version": NOTION_VERSION, "Content-Type": "application/json"}
@@ -588,6 +589,10 @@ def run(dry_run: bool = False, refresh_costs: bool = True, today: date | None = 
                 summary["costs"] = sync_costs(conn)
             except Exception as exc:   # keep going on yesterday's copy rather than skip a day
                 summary["costs_error"] = f"{type(exc).__name__}: {exc}"
+                try:   # say which Notion connection this is, so the right one can be given access
+                    summary["notion_connection_name"] = _notion("GET", "/users/me").get("name")
+                except Exception:
+                    pass
         _set_step("reading reimbursements and the ledger")
         groups = _load_groups(conn, today)
         fnskus = sorted({g["fnsku"] for g in groups if g["fnsku"]})
