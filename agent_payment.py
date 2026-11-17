@@ -21,11 +21,11 @@ Nothing here writes to Amazon. It reads our own database and Notion and writes A
 Env vars (all optional except the tokens)
   ASANA_TOKEN                    without it the agent only records what it WOULD create
   ASANA_PROJECT_GID              default: Reimbursement Case Discrepancy board
-  ASANA_SECTION_NAME             default: "To Be Opened"
-  ASANA_ASSIGNEE_GID             leave empty for unassigned tasks
+  ASANA_ASSIGNEE_GID             who gets the tasks (default Azel); "none" for unassigned
+  ASANA_SECTION_100 / _50        section names on the board (default "To file: 100%" / "To file: 50%")
   NOTION_TOKEN                   already set on this service
   NOTION_SKU_DB / NOTION_COGS_DB / NOTION_LINE_ITEMS_DB   Notion database ids
-  PAYMENT_AGENT_PAUSED=1         kill switch
+  PAYMENT_AGENT_PAUSED=1         dry run only: the list is worked out daily, nothing is created or changed in Asana
   PAYMENT_AGENT_MAX_TASKS        most tasks created in one run (default 100)
   PAYMENT_AGENT_SKIP_SKU         comma list of text; SKUs containing any are ignored (default "ROP")
   PAYMENT_AGENT_ALREADY_FILED    comma list of reimbursement ids filed by hand; never tasked
@@ -38,6 +38,7 @@ import threading
 import time
 import traceback
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from decimal import Decimal
 
 import requests
@@ -62,7 +63,10 @@ HALF_STATUSES = ("CUSTOMER_DAMAGED", "DEFECTIVE")
 
 ASANA_API = "https://app.asana.com/api/1.0"
 ASANA_PROJECT_GID = os.environ.get("ASANA_PROJECT_GID", "1211663281581349")
-ASANA_SECTION_NAME = os.environ.get("ASANA_SECTION_NAME", "To Be Opened")
+ASANA_SECTION_100 = os.environ.get("ASANA_SECTION_100", "To file: 100%")
+ASANA_SECTION_50 = os.environ.get("ASANA_SECTION_50", "To file: 50%")
+ASANA_ASSIGNEE_GID = os.environ.get("ASANA_ASSIGNEE_GID", "1207717933464435")   # Azel Lauzon; set to "none" for unassigned
+BUSINESS_TZ = ZoneInfo("America/New_York")
 NOTION_SKU_DB = os.environ.get("NOTION_SKU_DB", "2630ab7bdc07806daf93d8a80acbc67e")
 NOTION_COGS_DB = os.environ.get("NOTION_COGS_DB", "2630ab7bdc078034b64afa9daafcca20")
 NOTION_LINE_ITEMS_DB = os.environ.get("NOTION_LINE_ITEMS_DB", "2370ab7bdc07817f83b7f9fd7d4827a9")
@@ -115,14 +119,44 @@ def ensure_tables(conn):
             CREATE TABLE IF NOT EXISTS payment_agent_runs (
                 id bigserial PRIMARY KEY, started_at timestamptz NOT NULL DEFAULT now(), finished_at timestamptz,
                 status text NOT NULL, dry_run boolean, summary jsonb, error text);
+            CREATE TABLE IF NOT EXISTS sku_cost_uploads (
+                sku text PRIMARY KEY, uploaded_on date NOT NULL, rejected boolean NOT NULL DEFAULT false,
+                source text, noted_at timestamptz NOT NULL DEFAULT now());
+            ALTER TABLE payment_claims ADD COLUMN IF NOT EXISTS steps_version text;
+            ALTER TABLE payment_claims ADD COLUMN IF NOT EXISTS task_completed_at timestamptz;
         """)
+        _seed_cost_uploads(cur)
         cur.execute("""SELECT count(*) FROM information_schema.columns
                        WHERE table_name = 'ledger_detail' AND column_name IN ('fnsku', 'event_date')""")
         if cur.fetchone()[0] == 2:   # speeds up the per-item ledger lookups; harmless if it already exists
             cur.execute("CREATE INDEX IF NOT EXISTS ledger_detail_fnsku_date_idx ON ledger_detail (fnsku, event_date)")
         cur.execute("SELECT 1 FROM pg_roles WHERE rolname = 'ledger_reader'")
         if cur.fetchone():
-            cur.execute("GRANT SELECT ON sku_costs, payment_claims, payment_agent_runs TO ledger_reader")
+            cur.execute("GRANT SELECT ON sku_costs, payment_claims, payment_agent_runs, sku_cost_uploads TO ledger_reader")
+
+
+def _seed_cost_uploads(cur):
+    """sourcing_cost_uploads_seed.csv (sku,uploaded_on) lists costs already uploaded to Amazon by hand."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sourcing_cost_uploads_seed.csv")
+    if not os.path.exists(path):
+        return
+    import csv
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            if row.get("sku") and row.get("uploaded_on"):
+                cur.execute("""INSERT INTO sku_cost_uploads (sku, uploaded_on, source) VALUES (%s, %s, 'seed file')
+                               ON CONFLICT (sku) DO NOTHING""", (row["sku"].strip().upper(), row["uploaded_on"].strip()))
+
+
+def steps_version(c: dict, uploads: dict) -> str:
+    """A = upload the sourcing cost first, then open the case.  B = it was already tried: go straight to the case."""
+    u = uploads.get(c["sku"].upper())
+    if not u:
+        return "A"
+    if u["rejected"]:
+        return "B"
+    ref = c.get("loss_date") or c.get("approval_date")
+    return "B" if ref and ref >= u["uploaded_on"] else "A"
 
 
 # ------------------------------------------------------------------ Notion ---
@@ -353,6 +387,8 @@ def case_wording(c: dict) -> str:
                   f"SKU: {c['sku']} | FNSKU: {c['fnsku']} | ASIN: {c['asin']}",
                   f"The unit was in {cond} condition when it was {event}{where}.",
                   f"Sourcing cost: {_money(c['cost'])} per unit (invoice attached)"]
+    if c.get("steps_version") == "B":
+        lines.append("We already submitted this sourcing cost on the Sourcing Cost page. The attached invoice is our proof of cost.")
     if int(c["quantity"]) > 1:
         lines.append(f"Units: {c['quantity']}")
     lines += [f"Amount reimbursed: {_money(c['paid_total'])}",
@@ -362,10 +398,27 @@ def case_wording(c: dict) -> str:
     return "\n".join(lines)
 
 
-def task_fields(c: dict) -> dict:
+def due_tomorrow(now: datetime | None = None) -> date:
+    """Rule: every task is due the day after it is created (business time zone)."""
+    return ((now or datetime.now(timezone.utc)).astimezone(BUSINESS_TZ) + timedelta(days=1)).date()
+
+
+def task_fields(c: dict, uploaded_on: date | None = None) -> dict:
     name = (f"[{c['pct']}%] Sourcing cost dispute | {c['sku']} | Reimb {c['reimbursement_id']} | "
             f"short {_money(c['shortfall'])}")
-    notes = [f"File by: {c['deadline']:%b %-d, %Y} (60 days after Amazon issued the reimbursement)", "",
+    if c.get("steps_version") == "B":
+        when = f" on {uploaded_on:%b %-d, %Y}" if uploaded_on else ""
+        steps = ["STEPS",
+                 f"1. Do NOT upload the sourcing cost again. It was already submitted{when}.",
+                 "2. Open the reimbursement case with the invoice. Use the amounts and wording below.",
+                 "3. Put the Amazon case number in the Case ID field."]
+    else:
+        steps = ["STEPS",
+                 f"1. Upload the sourcing cost for this SKU first: {c['sku']} = {_money(c['cost'])} per unit.",
+                 "2. Then open the reimbursement case with the invoice. Use the amounts and wording below.",
+                 "3. Put the Amazon case number in the Case ID field."]
+    notes = steps + ["",
+             f"Amazon's deadline: {c['deadline']:%b %-d, %Y} (60 days after Amazon issued the reimbursement)", "",
              "FOR THE CASE FORM",
              f"Amount reimbursed: {_money(c['paid_total'])}",
              f"Correct amount: {_money(c['correct_total'])}", "",
@@ -381,7 +434,7 @@ def task_fields(c: dict) -> dict:
     if c.get("check_note"):
         notes += ["", "CHECK FIRST: " + c["check_note"]]
     notes += ["", "CASE WORDING (copy and paste)", case_wording(c)]
-    return {"name": name, "notes": "\n".join(notes), "due_on": str(c["deadline"])}
+    return {"name": name, "notes": "\n".join(notes), "due_on": str(due_tomorrow())}
 
 
 # ------------------------------------------------------------------- Asana ---
@@ -399,26 +452,67 @@ def _asana(method: str, path: str, token: str, **kw) -> dict:
     raise RuntimeError("Asana kept failing; stopped")
 
 
-def _asana_section(token: str) -> str:
-    for s in _asana("GET", f"/projects/{ASANA_PROJECT_GID}/sections", token):
-        if s["name"].strip().lower() == ASANA_SECTION_NAME.strip().lower():
-            return s["gid"]
-    raise RuntimeError(f'Asana section "{ASANA_SECTION_NAME}" not found on project {ASANA_PROJECT_GID}')
+def _asana_sections(token: str) -> dict:
+    """{100: gid, 50: gid} for the two to-file sections on the discrepancy board."""
+    by_name = {x["name"].strip().lower(): x["gid"] for x in _asana("GET", f"/projects/{ASANA_PROJECT_GID}/sections", token)}
+    out = {}
+    for pct, name in ((100, ASANA_SECTION_100), (50, ASANA_SECTION_50)):
+        if name.strip().lower() not in by_name:
+            raise RuntimeError(f'Asana section "{name}" not found on project {ASANA_PROJECT_GID}')
+        out[pct] = by_name[name.strip().lower()]
+    return out
 
 
-def create_task(token: str, section_gid: str, c: dict) -> str:
-    data = {**task_fields(c), "projects": [ASANA_PROJECT_GID],
-            "memberships": [{"project": ASANA_PROJECT_GID, "section": section_gid}]}
-    if os.environ.get("ASANA_ASSIGNEE_GID"):
-        data["assignee"] = os.environ["ASANA_ASSIGNEE_GID"]
+def create_task(token: str, sections: dict, c: dict, uploaded_on: date | None = None) -> str:
+    data = {**task_fields(c, uploaded_on), "projects": [ASANA_PROJECT_GID],
+            "memberships": [{"project": ASANA_PROJECT_GID, "section": sections[50 if c["pct"] == 50 else 100]}]}
+    if ASANA_ASSIGNEE_GID and ASANA_ASSIGNEE_GID.lower() != "none":
+        data["assignee"] = ASANA_ASSIGNEE_GID
     return _asana("POST", "/tasks", token, json={"data": data})["gid"]
+
+
+def housekeeping(conn, token: str, sections: dict) -> dict:
+    """For every task this agent created that is not finished yet:
+    - still waiting to be filed and its due date was changed -> put it back (Asana cannot lock a due date)
+    - completed -> remember it, and log the sourcing cost as uploaded if the task asked for that (version A)."""
+    to_file = set(sections.values())
+    reset = completed = 0
+    with conn.cursor() as cur:
+        cur.execute("""SELECT reimbursement_id, sku, asana_task_gid, steps_version FROM payment_claims
+                       WHERE asana_task_gid IS NOT NULL AND task_completed_at IS NULL""")
+        rows = cur.fetchall()
+    for rid, sku, gid, version in rows:
+        try:
+            t = _asana("GET", f"/tasks/{gid}", token,
+                       params={"opt_fields": "completed,completed_at,due_on,created_at,memberships.section.gid"})
+        except Exception:
+            continue   # deleted or unreachable: leave it for the safety net
+        if t.get("completed"):
+            done = datetime.fromisoformat(t["completed_at"].replace("Z", "+00:00"))
+            with conn.cursor() as cur:
+                cur.execute("UPDATE payment_claims SET task_completed_at=%s WHERE reimbursement_id=%s AND sku=%s",
+                            (done, rid, sku))
+                if version == "A":
+                    cur.execute("""INSERT INTO sku_cost_uploads (sku, uploaded_on, source) VALUES (%s, %s, %s)
+                                   ON CONFLICT (sku) DO NOTHING""",
+                                (sku.upper(), done.astimezone(BUSINESS_TZ).date(), f"task {gid} completed"))
+            completed += 1
+            continue
+        in_to_file = any((m.get("section") or {}).get("gid") in to_file for m in t.get("memberships", []))
+        want = str(due_tomorrow(datetime.fromisoformat(t["created_at"].replace("Z", "+00:00"))))
+        if in_to_file and t.get("due_on") != want:
+            _asana("PUT", f"/tasks/{gid}", token, json={"data": {"due_on": want}})
+            _asana("POST", f"/tasks/{gid}/stories", token, json={"data": {"text":
+                   f"Due date was changed. It is locked to the day after the task was created, so it was put back to {want}."}})
+            reset += 1
+    return {"due_dates_put_back": reset, "tasks_completed": completed}
 
 
 # --------------------------------------------------------------------- run ---
 
 CLAIM_COLS = ["reimbursement_id", "sku", "approval_date", "deadline", "reason", "fnsku", "asin", "quantity",
               "paid_total", "status_when_lost", "loss_date", "loss_fc", "rule", "pct", "cost", "correct_total",
-              "shortfall", "verdict", "check_note", "invoice_number", "invoice_url", "invoice_price"]
+              "shortfall", "verdict", "check_note", "invoice_number", "invoice_url", "invoice_price", "steps_version"]
 
 
 def _load_groups(conn, today: date) -> list[dict]:
@@ -477,7 +571,7 @@ def _save(conn, c: dict):
 def run(dry_run: bool = False, refresh_costs: bool = True, today: date | None = None) -> dict:
     today = today or datetime.now(timezone.utc).date()
     token = os.environ.get("ASANA_TOKEN", "")
-    if not token:
+    if not token or os.environ.get("PAYMENT_AGENT_PAUSED") == "1":
         dry_run = True
     conn = ledger._db()
     ensure_tables(conn)
@@ -501,6 +595,14 @@ def run(dry_run: bool = False, refresh_costs: bool = True, today: date | None = 
             cur.execute("SELECT reimbursement_id, sku FROM payment_claims WHERE asana_task_gid IS NOT NULL")
             tasked = set(cur.fetchall())
         filed = _already_filed()
+        sections = None
+        if not dry_run:
+            sections = _asana_sections(token)
+            _set_step("checking due dates and finished tasks")
+            summary["housekeeping"] = housekeeping(conn, token, sections)
+        with conn.cursor() as cur:
+            cur.execute("SELECT sku, uploaded_on, rejected FROM sku_cost_uploads")
+            uploads = {sku: {"uploaded_on": d, "rejected": r} for sku, d, r in cur.fetchall()}
 
         counts, to_task = {}, []
         for g in groups:
@@ -516,7 +618,6 @@ def run(dry_run: bool = False, refresh_costs: bool = True, today: date | None = 
 
         to_task.sort(key=lambda c: (c["deadline"], c["reimbursement_id"]))
         max_tasks = int(os.environ.get("PAYMENT_AGENT_MAX_TASKS", "100"))
-        section = _asana_section(token) if not dry_run and to_task else None
         created, errors = 0, []
         for c in to_task:
             _set_step(f"claim {c['reimbursement_id']}: looking up the invoice")
@@ -526,11 +627,12 @@ def run(dry_run: bool = False, refresh_costs: bool = True, today: date | None = 
                     c.update(find_invoice(upc_id, c["cost"]))
             except Exception as exc:
                 c["check_note"] = ((c.get("check_note") or "") + f" Invoice lookup failed ({type(exc).__name__}).").strip()
+            c["steps_version"] = steps_version(c, uploads)
             _save(conn, c)
             if dry_run or created >= max_tasks:
                 continue
             try:
-                gid = create_task(token, section, c)
+                gid = create_task(token, sections, c, (uploads.get(c["sku"].upper()) or {}).get("uploaded_on"))
                 with conn.cursor() as cur:
                     cur.execute("""UPDATE payment_claims SET asana_task_gid=%s, task_created_at=now()
                                    WHERE reimbursement_id=%s AND sku=%s""", (gid, c["reimbursement_id"], c["sku"]))
@@ -586,12 +688,12 @@ def _run_in_background(dry_run: bool, wait: bool):
 def trigger(dry_run: bool = Query(False), wait_for_syncs: bool = Query(True), x_sync_token: str = Header("")):
     if not ledger.LEDGER_SYNC_TOKEN or x_sync_token != ledger.LEDGER_SYNC_TOKEN:
         raise HTTPException(401, "bad or missing X-Sync-Token")
-    if os.environ.get("PAYMENT_AGENT_PAUSED") == "1":
-        return {"started": False, "reason": "payment accuracy agent is paused (PAYMENT_AGENT_PAUSED=1)"}
+    paused = os.environ.get("PAYMENT_AGENT_PAUSED") == "1"
+    dry_run = dry_run or paused          # paused = still work out the list every day, but touch nothing in Asana
     if not _run_lock.acquire(blocking=False):
         return {"started": False, "reason": "the payment accuracy agent is already running"}
     threading.Thread(target=_run_in_background, args=(dry_run, wait_for_syncs), daemon=True).start()
-    return {"started": True, "dry_run": dry_run or not os.environ.get("ASANA_TOKEN")}
+    return {"started": True, "paused": paused, "dry_run": dry_run or not os.environ.get("ASANA_TOKEN")}
 
 
 @router.get("/status")

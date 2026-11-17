@@ -35,7 +35,7 @@ READER_ROLE = "ledger_reader"
 TABLES = ("ledger_detail", "ledger_summary", "ledger_sync_runs", "ledger_loaded_windows")
 # Filled by claims_data.py; described only once they exist and the reader login can read them.
 EXTRA_TABLES = ("fba_reimbursements", "fba_customer_returns", "claims_sync_runs",
-                "payment_claims", "payment_agent_runs", "sku_costs")
+                "payment_claims", "payment_agent_runs", "sku_costs", "sku_cost_uploads")
 EXTRA_DATE_COLS = {"fba_reimbursements": "approval_date", "fba_customer_returns": "return_date"}
 MAX_ROWS = 2000
 SUPPORTED_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")

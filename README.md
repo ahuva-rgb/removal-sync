@@ -116,3 +116,15 @@ or a task already exists for that reimbursement. Each reimbursement is tasked on
 - Inbound reimbursements are off until checked by hand (`PAYMENT_AGENT_INCLUDE_INBOUND=1`).
 - The Notion integration behind `NOTION_TOKEN` needs access to the SKU & ASIN, UPC, COGS, Invoices and
   Line Items databases.
+
+### Agent 3 update (Nov 17)
+
+- Tasks go to the board "Reimbursement Case Discrepancy", section "To file: 100%" or "To file: 50%", assigned to Azel
+  (`ASANA_ASSIGNEE_GID`), due the day after they are created. Asana cannot lock a due date, so each run puts the date
+  back on any of its tasks still waiting to be filed and leaves a comment.
+- Every task starts with STEPS. Version A: upload the sourcing cost first, then open the case. Version B: the cost
+  was already submitted for that SKU before the loss (table `sku_cost_uploads`), so go straight to the case.
+  A version A task that gets completed logs the SKU as uploaded. Costs uploaded by hand can be listed in
+  `sourcing_cost_uploads_seed.csv` (`sku,uploaded_on`).
+- `PAYMENT_AGENT_PAUSED=1` now means dry run: the daily list is still written to `payment_claims`, nothing is
+  created or changed in Asana.
