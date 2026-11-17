@@ -144,8 +144,10 @@ def _seed_cost_uploads(cur):
     with open(path, newline="") as f:
         for row in csv.DictReader(f):
             if row.get("sku") and row.get("uploaded_on"):
-                cur.execute("""INSERT INTO sku_cost_uploads (sku, uploaded_on, source) VALUES (%s, %s, 'seed file')
-                               ON CONFLICT (sku) DO NOTHING""", (row["sku"].strip().upper(), row["uploaded_on"].strip()))
+                cur.execute("""INSERT INTO sku_cost_uploads (sku, uploaded_on, rejected, source)
+                               VALUES (%s, %s, %s, 'seed file') ON CONFLICT (sku) DO NOTHING""",
+                            (row["sku"].strip().upper(), row["uploaded_on"].strip(),
+                             (row.get("rejected") or "").strip().lower() == "true"))
 
 
 def steps_version(c: dict, uploads: dict) -> str:
