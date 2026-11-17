@@ -300,6 +300,12 @@ try:
 except Exception as _claims_exc:  # pragma: no cover
     print(f"claims data router not mounted: {type(_claims_exc).__name__}: {_claims_exc}")
 
+try:
+    from agent_payment import router as agent_payment_router
+    app.include_router(agent_payment_router)
+except Exception as _agent_payment_exc:  # pragma: no cover
+    print(f"payment accuracy agent not mounted: {type(_agent_payment_exc).__name__}: {_agent_payment_exc}")
+
 # Read-only "Ledger" connector for Claude (see mcp_ledger.py).
 try:
     from mcp_ledger import router as mcp_ledger_router

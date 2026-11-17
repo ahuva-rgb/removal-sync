@@ -87,3 +87,44 @@ refunded units actually came back. Both reports need only the Amazon Fulfillment
 - Switches: `CLAIMS_PAUSED=1` on the service turns it off; `CLAIMS_SYNC=0` on the cron job skips the call.
 - `GET /claims/status` shows row counts, date coverage and recent runs.
 - The Claude ledger connector (`mcp_ledger.py`) lists and can query the two new tables once they exist.
+
+
+## Agent 3: Payment accuracy (`agent_payment.py`)
+
+Runs every morning after the ledger and reimbursement syncs (the same cron job calls
+`POST /agents/payment-accuracy/run`; the agent waits for the syncs to finish).
+
+For each warehouse lost/damaged reimbursement Amazon issued in the last 60 days it finds the loss line
+in the Inventory Ledger, decides whether 100% or 50% of sourcing cost applies, compares with the
+cost in Notion on the loss date, and creates one Asana task per underpaid reimbursement
+(board "Reimbursement Case Discrepancy", section "To Be Opened"). The task holds the two amounts for
+the case form, the case wording, the filing deadline and the Notion invoice link.
+
+| Status when lost | How it got that status | Pays |
+|---|---|---|
+| Sellable | n/a | 100% |
+| Customer damaged / defective | customer return | 50% |
+| Customer damaged / defective | Amazon re-graded it (no returns, or re-graded at that warehouse within 45 days) | 100% |
+| Warehouse / carrier / distributor damaged | n/a | 100% |
+
+No task when the shortfall is under $1 a unit, the reimbursement was reversed, the SKU contains `ROP`,
+or a task already exists for that reimbursement. Each reimbursement is tasked once, ever.
+
+- Without `ASANA_TOKEN` the agent only records what it would create (table `payment_claims`).
+- `GET /agents/payment-accuracy/status` shows the last runs and counts.
+- `PAYMENT_AGENT_PAUSED=1` stops it. `PAYMENT_AGENT=0` on the cron job skips the call.
+- Inbound reimbursements are off until checked by hand (`PAYMENT_AGENT_INCLUDE_INBOUND=1`).
+- The Notion integration behind `NOTION_TOKEN` needs access to the SKU & ASIN, UPC, COGS, Invoices and
+  Line Items databases.
+
+### Agent 3 update (Nov 17)
+
+- Tasks go to the board "Reimbursement Case Discrepancy", section "To file: 100%" or "To file: 50%", assigned to Azel
+  (`ASANA_ASSIGNEE_GID`), due the day after they are created. Asana cannot lock a due date, so each run puts the date
+  back on any of its tasks still waiting to be filed and leaves a comment.
+- Every task starts with STEPS. Version A: upload the sourcing cost first, then open the case. Version B: the cost
+  was already submitted for that SKU before the loss (table `sku_cost_uploads`), so go straight to the case.
+  A version A task that gets completed logs the SKU as uploaded. Costs uploaded by hand can be listed in
+  `sourcing_cost_uploads_seed.csv` (`sku,uploaded_on`).
+- `PAYMENT_AGENT_PAUSED=1` now means dry run: the daily list is still written to `payment_claims`, nothing is
+  created or changed in Asana.
