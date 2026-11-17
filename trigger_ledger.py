@@ -2,6 +2,8 @@
 
 1. Inventory ledger            (POST /ledger/sync)
 2. Reimbursements + returns    (POST /claims/sync)   - skipped when CLAIMS_SYNC=0
+3. Payment accuracy agent      (POST /agents/payment-accuracy/run) - skipped when PAYMENT_AGENT=0.
+   It waits for 1 and 2 to finish, then creates Asana tasks for underpaid reimbursements.
 
 Env vars: REMOVAL_SYNC_URL, LEDGER_SYNC_TOKEN, optional LEDGER_MODE / CLAIMS_MODE
 (auto|daily|backfill), optional CLAIMS_SYNC (0 to skip).
@@ -28,6 +30,15 @@ if os.environ.get("CLAIMS_SYNC", "1") != "0":
         ok = ok and r.ok
     except requests.RequestException as exc:  # never let this hide the ledger result
         print("claims: request failed:", exc)
+        ok = False
+
+if os.environ.get("PAYMENT_AGENT", "1") != "0":
+    try:
+        r = requests.post(f"{url}/agents/payment-accuracy/run", headers=headers, timeout=120)
+        print("payment agent:", r.status_code, r.text)
+        ok = ok and r.ok
+    except requests.RequestException as exc:
+        print("payment agent: request failed:", exc)
         ok = False
 
 sys.exit(0 if ok else 1)
