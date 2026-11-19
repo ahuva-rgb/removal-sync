@@ -301,6 +301,12 @@ except Exception as _claims_exc:  # pragma: no cover
     print(f"claims data router not mounted: {type(_claims_exc).__name__}: {_claims_exc}")
 
 try:
+    from google_mail import router as google_mail_router
+    app.include_router(google_mail_router)
+except Exception as _google_mail_exc:  # pragma: no cover
+    print(f"google mail not mounted: {type(_google_mail_exc).__name__}: {_google_mail_exc}")
+
+try:
     from agent_payment import router as agent_payment_router
     app.include_router(agent_payment_router)
 except Exception as _agent_payment_exc:  # pragma: no cover
