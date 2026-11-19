@@ -124,6 +124,10 @@ def ensure_tables(conn):
                 source text, noted_at timestamptz NOT NULL DEFAULT now());
             ALTER TABLE payment_claims ADD COLUMN IF NOT EXISTS steps_version text;
             ALTER TABLE payment_claims ADD COLUMN IF NOT EXISTS task_completed_at timestamptz;
+            ALTER TABLE payment_claims ADD COLUMN IF NOT EXISTS upc text;
+            ALTER TABLE payment_claims ADD COLUMN IF NOT EXISTS invoice_attached_at timestamptz;
+            ALTER TABLE payment_claims ADD COLUMN IF NOT EXISTS invoice_attach_note text;
+            ALTER TABLE payment_claims ADD COLUMN IF NOT EXISTS invoice_attach_tries int NOT NULL DEFAULT 0;
         """)
         _seed_cost_uploads(cur)
         cur.execute("""SELECT count(*) FROM information_schema.columns
@@ -282,8 +286,12 @@ def find_invoice(upc_page_id: str, cost: Decimal) -> dict:
     cands.sort(reverse=True)
     _, _, price, inv_id = cands[0]
     inv = _notion("GET", f"/pages/{inv_id}")
-    return {"invoice_number": _text(inv["properties"].get("Invoice Number")) or None,
-            "invoice_url": inv.get("url"), "invoice_price": price}
+    ip = inv["properties"]
+    files = (ip.get("Invoice") or {}).get("files") or []
+    file_url = next((f.get("file", {}).get("url") or f.get("external", {}).get("url") for f in files), None)
+    return {"invoice_number": _text(ip.get("Invoice Number")) or None,
+            "invoice_url": inv.get("url"), "invoice_price": price,
+            "upc": upc, "_invoice_file_url": file_url, "_invoice_email_id": _text(ip.get("Email ID")) or None}
 
 
 # ---------------------------------------------------------------- deciding ---
@@ -511,11 +519,64 @@ def housekeeping(conn, token: str, sections: dict) -> dict:
     return {"due_dates_put_back": reset, "tasks_completed": completed}
 
 
+def attach_invoices(conn, token: str, upc_ids: dict | None = None, limit: int = 60) -> dict:
+    """Put the supplier invoice PDF, with this item's UPC highlighted, on every open task that lacks one."""
+    import invoice_pdf
+    out = {"attached": 0, "not_highlighted": 0, "not_found": 0, "errors": 0}
+    with conn.cursor() as cur:
+        cur.execute("""SELECT reimbursement_id, sku, asana_task_gid, cost, invoice_attach_tries FROM payment_claims
+                       WHERE asana_task_gid IS NOT NULL AND task_completed_at IS NULL
+                         AND invoice_attached_at IS NULL AND invoice_attach_tries < 6
+                       ORDER BY deadline LIMIT %s""", (limit,))
+        rows = cur.fetchall()
+    if rows and upc_ids is None:
+        _, upc_ids = _load_costs(conn, [r[1] for r in rows])
+    for rid, sku, gid, cost, _tries in rows:
+        _set_step(f"claim {rid}: attaching the invoice")
+        note, done, inv = None, False, {}
+        try:
+            upc_id = (upc_ids or {}).get(sku.upper())
+            inv = find_invoice(upc_id, Decimal(cost)) if upc_id else {}
+            if not inv.get("invoice_number"):
+                raise LookupError("no supplier invoice found in Notion for this UPC")
+            name, data, source = invoice_pdf.fetch(inv["invoice_number"], inv.get("upc") or "",
+                                                   inv.get("_invoice_file_url"), inv.get("_invoice_email_id"))
+            data, hits = invoice_pdf.highlight(data, inv.get("upc") or "", inv.get("invoice_price"))
+            fname = f"Invoice {inv['invoice_number']} - UPC {inv.get('upc') or 'unknown'}.pdf"
+            _asana("POST", "/attachments", token, data={"parent": gid},
+                   files={"file": (fname, data, "application/pdf")})
+            if hits:
+                note = f"attached from {source}, UPC highlighted"
+                text = (f"Invoice {inv['invoice_number']} is attached with UPC {inv['upc']} highlighted. "
+                        "Use this file as the proof of cost.")
+            else:
+                note = f"attached from {source}, NOT highlighted (UPC text not found in the PDF)"
+                text = (f"Invoice {inv['invoice_number']} is attached, but the UPC {inv.get('upc')} could not be "
+                        "highlighted automatically (the PDF may be a scan). Mark the line by hand before filing.")
+                out["not_highlighted"] += 1
+            _asana("POST", f"/tasks/{gid}/stories", token, json={"data": {"text": text}})
+            done = True
+            out["attached"] += 1
+        except LookupError as exc:
+            note = str(exc)[:300]
+            out["not_found"] += 1
+        except Exception as exc:
+            note = f"{type(exc).__name__}: {exc}"[:300]
+            out["errors"] += 1
+        with conn.cursor() as cur:
+            cur.execute("""UPDATE payment_claims SET invoice_attach_note=%s, invoice_attach_tries=invoice_attach_tries+1,
+                                  invoice_attached_at = CASE WHEN %s THEN now() ELSE NULL END,
+                                  upc = coalesce(upc, %s)
+                           WHERE reimbursement_id=%s AND sku=%s""",
+                        (note, done, inv.get("upc"), rid, sku))
+    return out
+
+
 # --------------------------------------------------------------------- run ---
 
 CLAIM_COLS = ["reimbursement_id", "sku", "approval_date", "deadline", "reason", "fnsku", "asin", "quantity",
               "paid_total", "status_when_lost", "loss_date", "loss_fc", "rule", "pct", "cost", "correct_total",
-              "shortfall", "verdict", "check_note", "invoice_number", "invoice_url", "invoice_price", "steps_version"]
+              "shortfall", "verdict", "check_note", "invoice_number", "invoice_url", "invoice_price", "steps_version", "upc"]
 
 
 def _load_groups(conn, today: date) -> list[dict]:
@@ -648,6 +709,11 @@ def run(dry_run: bool = False, refresh_costs: bool = True, today: date | None = 
                 errors.append(f"{c['reimbursement_id']}: {exc}")
                 if len(errors) >= 3:
                     break
+        if not dry_run:
+            try:
+                summary["invoices"] = attach_invoices(conn, token, upc_ids)
+            except Exception as exc:
+                summary["invoices_error"] = f"{type(exc).__name__}: {exc}"
         summary.update(new_claims=len(to_task), tasks_created=created,
                        shortfall_new_claims=str(sum((c["shortfall"] for c in to_task), Decimal("0"))),
                        task_errors=errors)

@@ -128,3 +128,13 @@ or a task already exists for that reimbursement. Each reimbursement is tasked on
   `sourcing_cost_uploads_seed.csv` (`sku,uploaded_on`).
 - `PAYMENT_AGENT_PAUSED=1` now means dry run: the daily list is still written to `payment_claims`, nothing is
   created or changed in Asana.
+
+### Invoice PDFs on agent 3 tasks, and the mailbox connection
+
+- `google_mail.py`: read-only Gmail access. One-time sign-in per mailbox at `/google/connect`
+  (only `cases@` and `invoices@` can be connected; scope is `gmail.readonly`). `/google/status` shows what is connected.
+  Needs `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`.
+- `invoice_pdf.py`: finds the supplier invoice PDF (Notion file, then the email Notion recorded, then a mailbox
+  search by invoice number) and highlights the item's UPC and unit price.
+- Agent 3 attaches that PDF to every open task that does not have one yet, including tasks created earlier,
+  and leaves a comment. If the UPC cannot be highlighted (a scan) it says so on the task.
