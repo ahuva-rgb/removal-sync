@@ -400,11 +400,8 @@ def classify(group: dict, adjustments: list[dict], returns: list[dict],
     cost = cost_on(cost_history, loss_date)
     if cost is None:
         return {**out, "verdict": "no_cost_in_notion"}
-    if approved_cost is not None and approved_cost > cost + Decimal("0.02"):
-        # Amazon has already approved a higher sourcing cost from us than Notion shows: claim the approved amount
-        notes.append(f"Amazon's approved sourcing cost ({_money(approved_cost)}) is higher than Notion "
-                     f"({_money(cost)}). This task claims the approved amount. Notion should be checked.")
-        cost = Decimal(approved_cost)
+    # The claim is always the CURRENT Notion cost. A higher cost approved on Amazon is not claimed,
+    # because there is no invoice to back the higher figure. (approved_cost is only used to pick the task steps.)
     per_unit = (cost * pct / 100).quantize(Decimal("0.01"))
     correct = per_unit * qty
     short = correct - paid
