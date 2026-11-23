@@ -62,7 +62,7 @@ INBOUND_REASONS = ("Lost_Inbound", "Damaged_Inbound")
 HALF_STATUSES = ("CUSTOMER_DAMAGED", "DEFECTIVE")
 
 ASANA_API = "https://app.asana.com/api/1.0"
-ASANA_PROJECT_GID = os.environ.get("ASANA_PROJECT_GID", "1211663281581349")
+ASANA_PROJECT_GID = os.environ.get("ASANA_PROJECT_GID", "1220818804510392")
 ASANA_SECTION_100 = os.environ.get("ASANA_SECTION_100", "To file: 100%")
 ASANA_SECTION_50 = os.environ.get("ASANA_SECTION_50", "To file: 50%")
 ASANA_ASSIGNEE_GID = os.environ.get("ASANA_ASSIGNEE_GID", "1207717933464435")   # Azel Lauzon; set to "none" for unassigned
