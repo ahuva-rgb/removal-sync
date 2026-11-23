@@ -138,3 +138,12 @@ or a task already exists for that reimbursement. Each reimbursement is tasked on
   search by invoice number) and highlights the item's UPC and unit price.
 - Agent 3 attaches that PDF to every open task that does not have one yet, including tasks created earlier,
   and leaves a comment. If the UPC cannot be highlighted (a scan) it says so on the task.
+
+### Agent 3 checks every reimbursement type
+
+- Checked: Lost/Damaged Warehouse, Lost/Damaged Inbound, Lost Outbound, CustomerReturn, CustomerServiceIssue,
+  ReturnAdjustment. Rule: 50% of sourcing cost only when a customer returned the unit damaged or defective
+  (order-based types read this from the Customer Returns report by order ID); 100% otherwise.
+- GeneralAdjustment rows are added to the reimbursement they correct; reversed reimbursements are skipped.
+- `PAYMENT_AGENT_LIVE_REASONS` (default the two warehouse types, or `all`) decides which types may create tasks.
+  The rest are saved daily in `payment_claims` with verdict `claim` and no task, for review.

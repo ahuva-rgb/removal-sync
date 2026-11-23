@@ -30,7 +30,8 @@ Env vars (all optional except the tokens)
   PAYMENT_AGENT_SKIP_SKU         comma list of text; SKUs containing any are ignored (default "ROP")
   PAYMENT_AGENT_ALREADY_FILED    comma list of reimbursement ids filed by hand; never tasked
                                  (default: the two Cassie filed on Nov 17, 2026)
-  PAYMENT_AGENT_INCLUDE_INBOUND  1 to also check Lost_Inbound / Damaged_Inbound (off until checked by hand)
+  PAYMENT_AGENT_LIVE_REASONS     reimbursement types that may create tasks (default the two warehouse ones;
+                                 "all" for every type). Other types are still checked and listed, with no task.
 """
 import json
 import os
@@ -59,6 +60,9 @@ DAMAGED_CODES = ("E", "H", "K", "U", "6")
 REGRADE_IN_CODES = ("P",) + DAMAGED_CODES      # positive quantity = unit moved INTO this status by Amazon
 WAREHOUSE_REASONS = ("Lost_Warehouse", "Damaged_Warehouse")
 INBOUND_REASONS = ("Lost_Inbound", "Damaged_Inbound")
+OUTBOUND_REASONS = ("Lost_Outbound",)
+ORDER_REASONS = ("CustomerReturn", "CustomerServiceIssue", "ReturnAdjustment")     # tied to a customer order
+ALL_REASONS = WAREHOUSE_REASONS + INBOUND_REASONS + OUTBOUND_REASONS + ORDER_REASONS
 HALF_STATUSES = ("CUSTOMER_DAMAGED", "DEFECTIVE")
 
 ASANA_API = "https://app.asana.com/api/1.0"
@@ -88,8 +92,17 @@ def _skip_patterns():
 
 
 def _reasons():
-    inbound = os.environ.get("PAYMENT_AGENT_INCLUDE_INBOUND") == "1"
-    return WAREHOUSE_REASONS + (INBOUND_REASONS if inbound else ())
+    """Every reimbursement type is checked. (Reversals and adjustments are netted into the one they belong to.)"""
+    return ALL_REASONS
+
+
+def _live_reasons():
+    """Reimbursement types that may create Asana tasks. The others are worked out and saved every day
+    (verdict 'claim', no task) so the list can be reviewed before they are switched on."""
+    raw = os.environ.get("PAYMENT_AGENT_LIVE_REASONS", ",".join(WAREHOUSE_REASONS))
+    if raw.strip().lower() == "all":
+        return set(ALL_REASONS)
+    return {r.strip() for r in raw.split(",") if r.strip()}
 
 
 def _already_filed():
@@ -125,6 +138,7 @@ def ensure_tables(conn):
             ALTER TABLE payment_claims ADD COLUMN IF NOT EXISTS steps_version text;
             ALTER TABLE payment_claims ADD COLUMN IF NOT EXISTS task_completed_at timestamptz;
             ALTER TABLE payment_claims ADD COLUMN IF NOT EXISTS upc text;
+            ALTER TABLE payment_claims ADD COLUMN IF NOT EXISTS amazon_order_id text;
             ALTER TABLE payment_claims ADD COLUMN IF NOT EXISTS invoice_attached_at timestamptz;
             ALTER TABLE payment_claims ADD COLUMN IF NOT EXISTS invoice_attach_note text;
             ALTER TABLE payment_claims ADD COLUMN IF NOT EXISTS invoice_attach_tries int NOT NULL DEFAULT 0;
@@ -134,6 +148,10 @@ def ensure_tables(conn):
                        WHERE table_name = 'ledger_detail' AND column_name IN ('fnsku', 'event_date')""")
         if cur.fetchone()[0] == 2:   # speeds up the per-item ledger lookups; harmless if it already exists
             cur.execute("CREATE INDEX IF NOT EXISTS ledger_detail_fnsku_date_idx ON ledger_detail (fnsku, event_date)")
+        cur.execute("SELECT to_regclass('fba_reimbursements') IS NOT NULL")
+        if cur.fetchone()[0]:        # netting adjustments and reversals looks rows up by the reimbursement they point at
+            cur.execute("""CREATE INDEX IF NOT EXISTS fba_reimbursements_original_idx
+                           ON fba_reimbursements (original_reimbursement_id)""")
         cur.execute("SELECT 1 FROM pg_roles WHERE rolname = 'ledger_reader'")
         if cur.fetchone():
             cur.execute("GRANT SELECT ON sku_costs, payment_claims, payment_agent_runs, sku_cost_uploads TO ledger_reader")
@@ -297,12 +315,16 @@ def find_invoice(upc_page_id: str, cost: Decimal) -> dict:
 # ---------------------------------------------------------------- deciding ---
 
 def classify(group: dict, adjustments: list[dict], returns: list[dict],
-             cost_history: list[tuple[date, Decimal]]) -> dict:
+             cost_history: list[tuple[date, Decimal]], order_returns: list[dict] | None = None) -> dict:
     """Decide one reimbursement. Pure function (no database, no network) so it can be tested.
 
     group        reimbursement_id, sku, fnsku, reason, approval_date, quantity, paid_total
     adjustments  ledger Adjustments rows for this FNSKU: event_date, reason, disposition, fc, quantity
     returns      ledger CustomerReturns rows into a non-sellable status: event_date, disposition, fc, quantity
+    order_returns  for order-based reimbursements: what the Customer Returns report shows for that order + SKU
+                   (return_date, disposition)
+
+    Rule: 50% of sourcing cost only when a customer returned the unit damaged or defective; 100% otherwise.
     """
     out = dict(group)
     approval = group["approval_date"]
@@ -317,6 +339,22 @@ def classify(group: dict, adjustments: list[dict], returns: list[dict],
     if group["reason"] in INBOUND_REASONS:
         status, loss_date, loss_fc = "SELLABLE", approval, None
         rule, pct = "New unit lost or damaged on the way in", 100
+    elif group["reason"] in OUTBOUND_REASONS:
+        status, loss_date, loss_fc = "SELLABLE", approval, None
+        rule, pct = "Sellable unit lost on the way to the customer", 100
+    elif group["reason"] in ORDER_REASONS:
+        loss_date, loss_fc = approval, None
+        back = sorted(order_returns or [], key=lambda r: r["return_date"], reverse=True)
+        half = [r for r in back if r["disposition"] in HALF_STATUSES]
+        if half:
+            status = half[0]["disposition"]
+            rule, pct = f"Customer returned the unit as {_pretty(status)} on {half[0]['return_date']:%b %-d}", 50
+        elif back:
+            status = back[0]["disposition"] or "SELLABLE"
+            rule, pct = f"Unit came back as {_pretty(status)} (not customer damaged or defective)", 100
+        else:
+            status = "SELLABLE"
+            rule, pct = "The returns report shows no unit coming back for this order", 100
     else:
         codes = LOST_CODES if group["reason"] == "Lost_Warehouse" else DAMAGED_CODES
         lo = approval - timedelta(days=LOSS_LOOKBACK_DAYS)
@@ -376,7 +414,12 @@ def case_wording(c: dict) -> str:
     """The text the VA pastes into the Amazon case. Short on purpose."""
     event = {"Lost_Warehouse": "lost in your fulfillment center", "Damaged_Warehouse": "damaged in your fulfillment center",
              "Lost_Inbound": "lost on the way into your fulfillment center",
-             "Damaged_Inbound": "damaged on the way into your fulfillment center"}[c["reason"]]
+             "Damaged_Inbound": "damaged on the way into your fulfillment center",
+             "Lost_Outbound": "lost on the way to the customer",
+             "CustomerReturn": "reimbursed for a customer return", "CustomerServiceIssue": "reimbursed for a customer service issue",
+             "ReturnAdjustment": "reimbursed as a return adjustment"}[c["reason"]]
+    if c.get("amazon_order_id"):
+        event += f" (order {c['amazon_order_id']})"
     where = f" ({c['loss_fc']}, {c['loss_date']:%b %-d, %Y})" if c.get("loss_fc") else ""
     lines = []
     if c["pct"] == 50:
@@ -394,6 +437,8 @@ def case_wording(c: dict) -> str:
                   f"Sourcing cost: {_money(c['cost'])} per unit (invoice attached)"]
     else:
         cond = "new" if c["reason"] in INBOUND_REASONS else _pretty(c["status_when_lost"])
+        if c["reason"] in ORDER_REASONS and c["status_when_lost"] == "SELLABLE" and "no unit coming back" in (c.get("rule") or ""):
+            cond = "sellable (the unit was never returned to inventory)"
         lines += [f"Reimbursement ID {c['reimbursement_id']} was paid below our sourcing cost.",
                   f"SKU: {c['sku']} | FNSKU: {c['fnsku']} | ASIN: {c['asin']}",
                   f"The unit was in {cond} condition when it was {event}{where}.",
@@ -576,14 +621,21 @@ def attach_invoices(conn, token: str, upc_ids: dict | None = None, limit: int = 
 
 CLAIM_COLS = ["reimbursement_id", "sku", "approval_date", "deadline", "reason", "fnsku", "asin", "quantity",
               "paid_total", "status_when_lost", "loss_date", "loss_fc", "rule", "pct", "cost", "correct_total",
-              "shortfall", "verdict", "check_note", "invoice_number", "invoice_url", "invoice_price", "steps_version", "upc"]
+              "shortfall", "verdict", "check_note", "invoice_number", "invoice_url", "invoice_price", "steps_version", "upc", "amazon_order_id"]
 
 
 def _load_groups(conn, today: date) -> list[dict]:
+    """One row per reimbursement + SKU from the last 60 days. Amazon's later corrections (GeneralAdjustment rows
+    pointing at it) are added to what was paid; reimbursements Amazon reversed are left out."""
     with conn.cursor() as cur:
         cur.execute("""
             SELECT r.reimbursement_id, r.sku, max(r.fnsku), max(r.asin), max(r.reason), min(r.approval_date),
-                   sum(r.quantity_reimbursed_cash), sum(r.amount_per_unit * r.quantity_reimbursed_cash)
+                   sum(r.quantity_reimbursed_cash),
+                   sum(r.amount_per_unit * r.quantity_reimbursed_cash)
+                     + coalesce((SELECT sum(x.amount_total) FROM fba_reimbursements x
+                                 WHERE x.original_reimbursement_id = r.reimbursement_id
+                                   AND x.reason = 'GeneralAdjustment' AND x.sku = r.sku), 0),
+                   max(r.amazon_order_id)
             FROM fba_reimbursements r
             WHERE r.reason = ANY(%s) AND r.quantity_reimbursed_cash > 0 AND r.approval_date >= %s
               AND r.sku IS NOT NULL AND r.sku <> ''
@@ -592,8 +644,22 @@ def _load_groups(conn, today: date) -> list[dict]:
                                 AND x.reason = 'Reimbursement_Reversal')
             GROUP BY r.reimbursement_id, r.sku""",
                     (list(_reasons()), today - timedelta(days=DISPUTE_DAYS)))
-        keys = ["reimbursement_id", "sku", "fnsku", "asin", "reason", "approval_date", "quantity", "paid_total"]
+        keys = ["reimbursement_id", "sku", "fnsku", "asin", "reason", "approval_date", "quantity", "paid_total",
+                "amazon_order_id"]
         return [dict(zip(keys, row)) for row in cur.fetchall()]
+
+
+def _load_order_returns(conn, order_ids: list[str]) -> dict:
+    """{(order_id, SKU): [{return_date, disposition}]} from the Customer Returns report."""
+    out = {}
+    if not order_ids:
+        return out
+    with conn.cursor() as cur:
+        cur.execute("""SELECT order_id, upper(sku), return_date::date, upper(coalesce(detailed_disposition, ''))
+                       FROM fba_customer_returns WHERE order_id = ANY(%s)""", (order_ids,))
+        for oid, sku, d, disp in cur.fetchall():
+            out.setdefault((oid, sku), []).append({"return_date": d, "disposition": disp})
+    return out
 
 
 def _load_ledger(conn, fnskus: list[str], since: date):
@@ -659,6 +725,9 @@ def run(dry_run: bool = False, refresh_costs: bool = True, today: date | None = 
         fnskus = sorted({g["fnsku"] for g in groups if g["fnsku"]})
         adj, ret = _load_ledger(conn, fnskus, today - timedelta(days=DISPUTE_DAYS + LOSS_LOOKBACK_DAYS + ORIGIN_LOOKBACK_DAYS))
         hist, upc_ids = _load_costs(conn, [g["sku"] for g in groups])
+        order_ret = _load_order_returns(conn, sorted({g["amazon_order_id"] for g in groups
+                                                      if g.get("amazon_order_id") and g["reason"] in ORDER_REASONS}))
+        live = _live_reasons()
         with conn.cursor() as cur:
             cur.execute("SELECT reimbursement_id, sku FROM payment_claims WHERE asana_task_gid IS NOT NULL")
             tasked = set(cur.fetchall())
@@ -672,17 +741,23 @@ def run(dry_run: bool = False, refresh_costs: bool = True, today: date | None = 
             cur.execute("SELECT sku, uploaded_on, rejected FROM sku_cost_uploads")
             uploads = {sku: {"uploaded_on": d, "rejected": r} for sku, d, r in cur.fetchall()}
 
-        counts, to_task = {}, []
+        counts, to_task, held, held_short = {}, [], {}, Decimal("0")
         for g in groups:
-            c = classify(g, adj.get(g["fnsku"], []), ret.get(g["fnsku"], []), hist.get(g["sku"].upper(), []))
+            c = classify(g, adj.get(g["fnsku"], []), ret.get(g["fnsku"], []), hist.get(g["sku"].upper(), []),
+                         order_ret.get((g.get("amazon_order_id"), g["sku"].upper()), []))
             if c["verdict"] == "claim" and c["reimbursement_id"] in filed:
                 c["verdict"] = "filed_by_hand"
             counts[c["verdict"]] = counts.get(c["verdict"], 0) + 1
-            if c["verdict"] == "claim" and (c["reimbursement_id"], c["sku"]) not in tasked:
+            if c["verdict"] == "claim" and c["reason"] not in live and (c["reimbursement_id"], c["sku"]) not in tasked:
+                held[c["reason"]] = held.get(c["reason"], 0) + 1      # listed for review, no task yet
+                held_short += c["shortfall"]
+                _save(conn, c)
+            elif c["verdict"] == "claim" and (c["reimbursement_id"], c["sku"]) not in tasked:
                 to_task.append(c)
             else:
                 _save(conn, c)
-        summary.update(checked=len(groups), verdicts=counts, already_tasked=len(tasked))
+        summary.update(checked=len(groups), verdicts=counts, already_tasked=len(tasked),
+                       held_for_review=held, held_for_review_shortfall=str(held_short))
 
         to_task.sort(key=lambda c: (c["deadline"], c["reimbursement_id"]))
         max_tasks = int(os.environ.get("PAYMENT_AGENT_MAX_TASKS", "100"))
