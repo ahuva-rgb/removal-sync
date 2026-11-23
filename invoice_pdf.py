@@ -18,6 +18,10 @@ INVOICE_MAILBOX = os.environ.get("INVOICE_MAILBOX", "invoices@gefenoptical.com")
 MAX_PDF_BYTES = 12 * 1024 * 1024
 
 
+class MailboxNotConnected(LookupError):
+    """The invoice could not be looked for at all (temporary): not the same as "there is no invoice"."""
+
+
 def pdf_text(data: bytes) -> str:
     import pymupdf
     with pymupdf.open(stream=data, filetype="pdf") as doc:
@@ -84,7 +88,7 @@ def fetch(invoice_number: str, upc: str, notion_file_url: str | None = None, ema
         except Exception as exc:
             reasons.append(f"Notion file download failed ({type(exc).__name__})")
     if not google_mail.is_connected(INVOICE_MAILBOX):
-        raise LookupError("; ".join(reasons + [f"{INVOICE_MAILBOX} is not connected yet"]))
+        raise MailboxNotConnected("; ".join(reasons + [f"{INVOICE_MAILBOX} is not connected yet"]))
     if email_id and re.fullmatch(r"[0-9a-f]{12,20}", email_id.strip()):
         try:
             hit = _from_message(email_id.strip(), invoice_number, upc)
@@ -103,3 +107,30 @@ def fetch(invoice_number: str, upc: str, notion_file_url: str | None = None, ema
                 return hit[0], hit[1], f"a search of {INVOICE_MAILBOX}"
         reasons.append(f"no email in {INVOICE_MAILBOX} has a PDF showing invoice {invoice_number}")
     raise LookupError("; ".join(reasons) or "no invoice number to look for")
+
+
+def fetch_by_upc(upc: str):
+    """No invoice number known: search the invoices mailbox for a PDF that shows this UPC.
+    Returns (filename, pdf bytes, where it came from) or raises LookupError."""
+    if not upc:
+        raise LookupError("no UPC to look for")
+    if not google_mail.is_connected(INVOICE_MAILBOX):
+        raise MailboxNotConnected(f"no supplier invoice in Notion for this UPC, and {INVOICE_MAILBOX} is not connected")
+    seen = 0
+    for mid in google_mail.search(INVOICE_MAILBOX, f'"{upc}" has:attachment', 10):
+        seen += 1
+        try:
+            msg = google_mail.message(INVOICE_MAILBOX, mid)
+        except Exception:
+            continue
+        for a in msg["attachments"]:
+            if not (a["filename"].lower().endswith(".pdf") or "pdf" in a["mime"]) or a["size"] > MAX_PDF_BYTES * 1.4:
+                continue
+            try:
+                data = google_mail.attachment(INVOICE_MAILBOX, mid, a["attachment_id"])
+                if _is_pdf(data) and len(data) <= MAX_PDF_BYTES and upc in pdf_text(data):
+                    return a["filename"], data, f"a search of {INVOICE_MAILBOX} for the UPC"
+            except Exception:
+                continue
+    raise LookupError(f"no supplier invoice in Notion for this UPC, and no PDF in {INVOICE_MAILBOX} shows UPC {upc}"
+                      + (f" ({seen} emails checked)" if seen else ""))
