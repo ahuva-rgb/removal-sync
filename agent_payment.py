@@ -47,6 +47,7 @@ import requests
 from fastapi import APIRouter, Header, HTTPException, Query
 
 import ledger
+import case_monitor
 
 router = APIRouter(prefix="/agents/payment-accuracy", tags=["agent: payment accuracy"])
 
@@ -146,6 +147,7 @@ def ensure_tables(conn):
             ALTER TABLE payment_claims ADD COLUMN IF NOT EXISTS invoice_attach_tries int NOT NULL DEFAULT 0;
         """)
         _seed_cost_uploads(cur)
+        case_monitor.ensure_tables(cur)
         cur.execute("""SELECT count(*) FROM information_schema.columns
                        WHERE table_name = 'ledger_detail' AND column_name IN ('fnsku', 'event_date')""")
         if cur.fetchone()[0] == 2:   # speeds up the per-item ledger lookups; harmless if it already exists
@@ -319,7 +321,8 @@ def find_invoice(upc_page_id: str, cost: Decimal) -> dict:
 # ---------------------------------------------------------------- deciding ---
 
 def classify(group: dict, adjustments: list[dict], returns: list[dict],
-             cost_history: list[tuple[date, Decimal]], order_returns: list[dict] | None = None) -> dict:
+             cost_history: list[tuple[date, Decimal]], order_returns: list[dict] | None = None,
+             approved_cost: Decimal | None = None) -> dict:
     """Decide one reimbursement. Pure function (no database, no network) so it can be tested.
 
     group        reimbursement_id, sku, fnsku, reason, approval_date, quantity, paid_total
@@ -397,6 +400,11 @@ def classify(group: dict, adjustments: list[dict], returns: list[dict],
     cost = cost_on(cost_history, loss_date)
     if cost is None:
         return {**out, "verdict": "no_cost_in_notion"}
+    if approved_cost is not None and approved_cost > cost + Decimal("0.02"):
+        # Amazon has already approved a higher sourcing cost from us than Notion shows: claim the approved amount
+        notes.append(f"Amazon's approved sourcing cost ({_money(approved_cost)}) is higher than Notion "
+                     f"({_money(cost)}). This task claims the approved amount. Notion should be checked.")
+        cost = Decimal(approved_cost)
     per_unit = (cost * pct / 100).quantize(Decimal("0.01"))
     correct = per_unit * qty
     short = correct - paid
@@ -475,17 +483,19 @@ def due_tomorrow(now: datetime | None = None) -> date:
 def task_fields(c: dict, uploaded_on: date | None = None) -> dict:
     name = (f"[{c['pct']}%] Sourcing cost dispute | {c['sku']} | Reimb {c['reimbursement_id']} | "
             f"short {_money(c['shortfall'])}")
+    tail = ["3. Put the Amazon case number in the Case ID field. The agent then watches for the payment.",
+            "4. Do NOT open an SAS case unless this task is moved to the \"SAS case needed\" section."]
     if c.get("steps_version") == "B":
-        when = f" on {uploaded_on:%b %-d, %Y}" if uploaded_on else ""
         steps = ["STEPS",
-                 f"1. Do NOT upload the sourcing cost again. It was already submitted{when}.",
-                 "2. Open the reimbursement case with the invoice. Use the amounts and wording below.",
-                 "3. Put the Amazon case number in the Case ID field."]
+                 f"1. Amazon has already approved our sourcing cost for this item ({_money(c['cost'])} per unit). "
+                 "Do not upload it again.",
+                 "2. Open the reimbursement case with the attached invoice. Use the amounts and wording below."] + tail
     else:
         steps = ["STEPS",
-                 f"1. Upload the sourcing cost for this SKU first: {c['sku']} = {_money(c['cost'])} per unit.",
-                 "2. Then open the reimbursement case with the invoice. Use the amounts and wording below.",
-                 "3. Put the Amazon case number in the Case ID field."]
+                 f"1. Upload the sourcing cost for this SKU first: {c['sku']} = {_money(c['cost'])} per unit, with the "
+                 "attached invoice. Amazon has not approved a cost from us for this item yet.",
+                 "2. When the cost shows as approved (\"seller submitted\") on Manage Your Sourcing Cost, open the "
+                 "reimbursement case. Use the amounts and wording below."] + tail
     notes = steps + ["",
              f"Amazon's deadline: {c['deadline']:%b %-d, %Y} (60 days after Amazon issued the reimbursement)", "",
              "FOR THE CASE FORM",
@@ -793,10 +803,20 @@ def run(dry_run: bool = False, refresh_costs: bool = True, today: date | None = 
             cur.execute("SELECT sku, uploaded_on, rejected FROM sku_cost_uploads")
             uploads = {sku: {"uploaded_on": d, "rejected": r} for sku, d, r in cur.fetchall()}
 
-        counts, to_task, held, held_short = {}, [], {}, Decimal("0")
+        if token:
+            _set_step("reading Amazon's sourcing cost export")
+            try:
+                summary["sourcing_cost_export"] = case_monitor.prepare(conn, token, dry_run)
+            except Exception as exc:
+                summary["sourcing_cost_export_error"] = f"{type(exc).__name__}: {exc}"
+        am_costs = case_monitor.amazon_costs(conn)
+
+        counts, to_task, held, held_short, fresh = {}, [], {}, Decimal("0"), {}
         for g in groups:
             c = classify(g, adj.get(g["fnsku"], []), ret.get(g["fnsku"], []), hist.get(g["sku"].upper(), []),
-                         order_ret.get((g.get("amazon_order_id"), g["sku"].upper()), []))
+                         order_ret.get((g.get("amazon_order_id"), g["sku"].upper()), []),
+                         case_monitor.seller_approved(am_costs, g["fnsku"]))
+            fresh[(c["reimbursement_id"], c["sku"])] = c
             if c["verdict"] == "claim" and c["reimbursement_id"] in filed:
                 c["verdict"] = "filed_by_hand"
             counts[c["verdict"]] = counts.get(c["verdict"], 0) + 1
@@ -822,7 +842,9 @@ def run(dry_run: bool = False, refresh_costs: bool = True, today: date | None = 
                     c.update(find_invoice(upc_id, c["cost"]))
             except Exception as exc:
                 c["check_note"] = ((c.get("check_note") or "") + f" Invoice lookup failed ({type(exc).__name__}).").strip()
-            c["steps_version"] = steps_version(c, uploads)
+            ok_cost = case_monitor.seller_approved(am_costs, c["fnsku"])
+            # B = Amazon already approved our cost: go straight to the case.  A = upload the cost first.
+            c["steps_version"] = "B" if ok_cost is not None and ok_cost >= c["cost"] - Decimal("0.02") else "A"
             _save(conn, c)
             if dry_run or created >= max_tasks:
                 continue
@@ -841,6 +863,12 @@ def run(dry_run: bool = False, refresh_costs: bool = True, today: date | None = 
                 summary["invoices"] = attach_invoices(conn, token, upc_ids, sections=sections)
             except Exception as exc:
                 summary["invoices_error"] = f"{type(exc).__name__}: {exc}"
+        if token:
+            _set_step("case monitor: checking payments and Amazon's replies")
+            try:
+                summary["monitor"] = case_monitor.monitor(conn, token, fresh, dry_run)
+            except Exception as exc:
+                summary["monitor_error"] = f"{type(exc).__name__}: {exc}"
         summary.update(new_claims=len(to_task), tasks_created=created,
                        shortfall_new_claims=str(sum((c["shortfall"] for c in to_task), Decimal("0"))),
                        task_errors=errors)
