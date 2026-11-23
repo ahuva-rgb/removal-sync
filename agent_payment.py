@@ -35,6 +35,7 @@ Env vars (all optional except the tokens)
 """
 import json
 import os
+import re
 import threading
 import time
 import traceback
@@ -69,6 +70,7 @@ ASANA_API = "https://app.asana.com/api/1.0"
 ASANA_PROJECT_GID = os.environ.get("ASANA_PROJECT_GID", "1220818804510392")
 ASANA_SECTION_100 = os.environ.get("ASANA_SECTION_100", "To file: 100%")
 ASANA_SECTION_50 = os.environ.get("ASANA_SECTION_50", "To file: 50%")
+ASANA_SECTION_NEEDS_INVOICE = os.environ.get("ASANA_SECTION_NEEDS_INVOICE", "Needs invoice: not found")
 ASANA_ASSIGNEE_GID = os.environ.get("ASANA_ASSIGNEE_GID", "1207717933464435")   # Azel Lauzon; set to "none" for unassigned
 BUSINESS_TZ = ZoneInfo("America/New_York")
 NOTION_SKU_DB = os.environ.get("NOTION_SKU_DB", "2630ab7bdc07806daf93d8a80acbc67e")
@@ -300,7 +302,7 @@ def find_invoice(upc_page_id: str, cost: Decimal) -> dict:
         price = Decimal(str(price)).quantize(Decimal("0.01"))
         cands.append((price == cost, li.get("created_time", ""), price, inv_ids[0]))
     if not cands:
-        return {}
+        return {"upc": upc}          # no invoice line in Notion: the mailbox can still be searched by UPC
     cands.sort(reverse=True)
     _, _, price, inv_id = cands[0]
     inv = _notion("GET", f"/pages/{inv_id}")
@@ -418,15 +420,18 @@ def case_wording(c: dict) -> str:
              "Lost_Outbound": "lost on the way to the customer",
              "CustomerReturn": "reimbursed for a customer return", "CustomerServiceIssue": "reimbursed for a customer service issue",
              "ReturnAdjustment": "reimbursed as a return adjustment"}[c["reason"]]
-    if c.get("amazon_order_id"):
-        event += f" (order {c['amazon_order_id']})"
+    order = f" on order {c['amazon_order_id']}" if c.get("amazon_order_id") else ""
+    kind = {"CustomerReturn": "a customer return", "CustomerServiceIssue": "a customer service issue",
+            "ReturnAdjustment": "a return adjustment"}.get(c["reason"])
     where = f" ({c['loss_fc']}, {c['loss_date']:%b %-d, %Y})" if c.get("loss_fc") else ""
     lines = []
     if c["pct"] == 50:
         lines += [f"Reimbursement ID {c['reimbursement_id']} was paid below 50% of our sourcing cost.",
                   f"SKU: {c['sku']} | FNSKU: {c['fnsku']} | ASIN: {c['asin']}",
-                  f"The unit was in {_pretty(c['status_when_lost'])} condition when it was {event}{where}. "
-                  "We understand only 50% of sourcing cost applies.",
+                  (f"This reimbursement was for {kind}{order}. The customer returned the unit as "
+                   f"{_pretty(c['status_when_lost'])}. We understand only 50% of sourcing cost applies." if kind else
+                   f"The unit was in {_pretty(c['status_when_lost'])} condition when it was {event}{where}. "
+                   "We understand only 50% of sourcing cost applies."),
                   f"Sourcing cost: {_money(c['cost'])} per unit (invoice attached)",
                   f"50% of sourcing cost: {_money(c['cost'] / 2)} per unit"]
     elif c["status_when_lost"] in HALF_STATUSES:
@@ -437,11 +442,17 @@ def case_wording(c: dict) -> str:
                   f"Sourcing cost: {_money(c['cost'])} per unit (invoice attached)"]
     else:
         cond = "new" if c["reason"] in INBOUND_REASONS else _pretty(c["status_when_lost"])
-        if c["reason"] in ORDER_REASONS and c["status_when_lost"] == "SELLABLE" and "no unit coming back" in (c.get("rule") or ""):
-            cond = "sellable (the unit was never returned to inventory)"
+        if kind and "no unit coming back" in (c.get("rule") or ""):
+            what = (f"This reimbursement was for {kind}{order}. The unit was never returned to inventory, "
+                    "so our full sourcing cost applies.")
+        elif kind:
+            what = (f"This reimbursement was for {kind}{order}. The unit came back as {cond}, which was not "
+                    "customer damage, so our full sourcing cost applies.")
+        else:
+            what = f"The unit was in {cond} condition when it was {event}{where}."
         lines += [f"Reimbursement ID {c['reimbursement_id']} was paid below our sourcing cost.",
                   f"SKU: {c['sku']} | FNSKU: {c['fnsku']} | ASIN: {c['asin']}",
-                  f"The unit was in {cond} condition when it was {event}{where}.",
+                  what,
                   f"Sourcing cost: {_money(c['cost'])} per unit (invoice attached)"]
     if c.get("steps_version") == "B":
         lines.append("We already submitted this sourcing cost on the Sourcing Cost page. The attached invoice is our proof of cost.")
@@ -519,6 +530,15 @@ def _asana_sections(token: str) -> dict:
     return out
 
 
+def _needs_invoice_section(token: str) -> str | None:
+    """Section for tasks that cannot be filed yet because no invoice PDF was found (None if the board has none)."""
+    want = ASANA_SECTION_NEEDS_INVOICE.strip().lower()
+    for x in _asana("GET", f"/projects/{ASANA_PROJECT_GID}/sections", token):
+        if x["name"].strip().lower() == want:
+            return x["gid"]
+    return None
+
+
 def create_task(token: str, sections: dict, c: dict, uploaded_on: date | None = None) -> str:
     data = {**task_fields(c, uploaded_on), "projects": [ASANA_PROJECT_GID],
             "memberships": [{"project": ASANA_PROJECT_GID, "section": sections[50 if c["pct"] == 50 else 100]}]}
@@ -564,28 +584,37 @@ def housekeeping(conn, token: str, sections: dict) -> dict:
     return {"due_dates_put_back": reset, "tasks_completed": completed}
 
 
-def attach_invoices(conn, token: str, upc_ids: dict | None = None, limit: int = 60) -> dict:
+def attach_invoices(conn, token: str, upc_ids: dict | None = None, limit: int = 120, sections: dict | None = None) -> dict:
     """Put the supplier invoice PDF, with this item's UPC highlighted, on every open task that lacks one."""
     import invoice_pdf
     out = {"attached": 0, "not_highlighted": 0, "not_found": 0, "errors": 0}
+    try:
+        needs = _needs_invoice_section(token)
+    except Exception:
+        needs = None
     with conn.cursor() as cur:
-        cur.execute("""SELECT reimbursement_id, sku, asana_task_gid, cost, invoice_attach_tries FROM payment_claims
+        cur.execute("""SELECT reimbursement_id, sku, asana_task_gid, cost, pct FROM payment_claims
                        WHERE asana_task_gid IS NOT NULL AND task_completed_at IS NULL
-                         AND invoice_attached_at IS NULL AND invoice_attach_tries < 6
-                       ORDER BY deadline LIMIT %s""", (limit,))
+                         AND invoice_attached_at IS NULL AND invoice_attach_tries < 30
+                       ORDER BY invoice_attach_tries, deadline LIMIT %s""", (limit,))
         rows = cur.fetchall()
     if rows and upc_ids is None:
         _, upc_ids = _load_costs(conn, [r[1] for r in rows])
-    for rid, sku, gid, cost, _tries in rows:
+    for rid, sku, gid, cost, pct in rows:
         _set_step(f"claim {rid}: attaching the invoice")
         note, done, inv = None, False, {}
         try:
             upc_id = (upc_ids or {}).get(sku.upper())
             inv = find_invoice(upc_id, Decimal(cost)) if upc_id else {}
-            if not inv.get("invoice_number"):
-                raise LookupError("no supplier invoice found in Notion for this UPC")
-            name, data, source = invoice_pdf.fetch(inv["invoice_number"], inv.get("upc") or "",
-                                                   inv.get("_invoice_file_url"), inv.get("_invoice_email_id"))
+            if inv.get("invoice_number"):
+                name, data, source = invoice_pdf.fetch(inv["invoice_number"], inv.get("upc") or "",
+                                                       inv.get("_invoice_file_url"), inv.get("_invoice_email_id"))
+            elif inv.get("upc"):       # Notion has no invoice line for it: look in the invoices mailbox by UPC
+                name, data, source = invoice_pdf.fetch_by_upc(inv["upc"])
+                inv["invoice_number"] = re.sub(r"\.pdf$", "", name, flags=re.I)[:60] or "from mailbox"
+                inv["invoice_price"] = Decimal(cost)
+            else:
+                raise LookupError("this SKU has no UPC in Notion, so no invoice can be looked up")
             data, hits = invoice_pdf.highlight(data, inv.get("upc") or "", inv.get("invoice_price"))
             fname = f"Invoice {inv['invoice_number']} - UPC {inv.get('upc') or 'unknown'}.pdf"
             _asana("POST", "/attachments", token, data={"parent": gid},
@@ -602,9 +631,30 @@ def attach_invoices(conn, token: str, upc_ids: dict | None = None, limit: int = 
             _asana("POST", f"/tasks/{gid}/stories", token, json={"data": {"text": text}})
             done = True
             out["attached"] += 1
+            if needs and sections:      # it may have been parked in "Needs invoice": it can be filed now
+                try:
+                    t = _asana("GET", f"/tasks/{gid}", token, params={"opt_fields": "memberships.section.gid"})
+                    if any((m.get("section") or {}).get("gid") == needs for m in t.get("memberships", [])):
+                        _asana("POST", f"/sections/{sections[50 if pct == 50 else 100]}/addTask", token,
+                               json={"data": {"task": gid}})
+                except Exception:
+                    pass
+        except invoice_pdf.MailboxNotConnected as exc:      # could not look: try again next run, do not park
+            note = str(exc)[:300]
+            out["not_found"] += 1
         except LookupError as exc:
             note = str(exc)[:300]
             out["not_found"] += 1
+            if needs and sections:      # cannot be filed without proof of cost: park it, visibly
+                try:
+                    t = _asana("GET", f"/tasks/{gid}", token, params={"opt_fields": "memberships.section.gid"})
+                    if any((m.get("section") or {}).get("gid") in set(sections.values()) for m in t.get("memberships", [])):
+                        _asana("POST", f"/sections/{needs}/addTask", token, json={"data": {"task": gid}})
+                        _asana("POST", f"/tasks/{gid}/stories", token, json={"data": {"text":
+                               "No invoice PDF could be found for this item (" + note + "). Add the supplier invoice to "
+                               "Notion or attach it here, then move this task back to To file."}})
+                except Exception:
+                    pass
         except Exception as exc:
             note = f"{type(exc).__name__}: {exc}"[:300]
             out["errors"] += 1
@@ -786,7 +836,7 @@ def run(dry_run: bool = False, refresh_costs: bool = True, today: date | None = 
                     break
         if not dry_run:
             try:
-                summary["invoices"] = attach_invoices(conn, token, upc_ids)
+                summary["invoices"] = attach_invoices(conn, token, upc_ids, sections=sections)
             except Exception as exc:
                 summary["invoices_error"] = f"{type(exc).__name__}: {exc}"
         summary.update(new_claims=len(to_task), tasks_created=created,
