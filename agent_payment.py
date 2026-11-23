@@ -271,13 +271,15 @@ def sync_costs(conn) -> dict:
     return {"cogs_rows": n_cogs, "sku_cost_rows": len(rows), "skus": len({k[0] for k in rows})}
 
 
-def cost_on(history: list[tuple[date, Decimal]], on: date) -> Decimal | None:
-    """Cost in effect on the loss date; if every price starts later, the earliest one."""
+def cost_on(history: list[tuple[date, Decimal]], on: date | None = None) -> Decimal | None:
+    """The CURRENT cost: the Notion COGS row with the latest "Price Valid From".
+
+    Older prices are never used, whatever the loss date was: the claim has to match what Notion
+    (and the invoice) show today. `on` is kept only so existing callers do not break.
+    """
     if not history:
         return None
-    history = sorted(history)
-    past = [c for vf, c in history if vf <= on]
-    return past[-1] if past else history[0][1]
+    return sorted(history)[-1][1]
 
 
 def find_invoice(upc_page_id: str, cost: Decimal) -> dict:
