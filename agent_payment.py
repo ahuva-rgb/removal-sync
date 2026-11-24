@@ -593,6 +593,11 @@ def housekeeping(conn, token: str, sections: dict) -> dict:
     return {"due_dates_put_back": reset, "tasks_completed": completed}
 
 
+def sku_numbers(sku: str) -> list[str]:
+    """Long numbers written inside a SKU (9 to 14 digits), in order. Spy bundles carry the supplier's item number."""
+    return re.findall(r"(?<!\d)\d{9,14}(?!\d)", sku or "")
+
+
 def attach_invoices(conn, token: str, upc_ids: dict | None = None, limit: int = 120, sections: dict | None = None) -> dict:
     """Put the supplier invoice PDF, with this item's UPC highlighted, on every open task that lacks one."""
     import invoice_pdf
@@ -615,22 +620,46 @@ def attach_invoices(conn, token: str, upc_ids: dict | None = None, limit: int = 
         try:
             upc_id = (upc_ids or {}).get(sku.upper())
             inv = find_invoice(upc_id, Decimal(cost)) if upc_id else {}
-            if inv.get("invoice_number"):
-                name, data, source = invoice_pdf.fetch(inv["invoice_number"], inv.get("upc") or "",
-                                                       inv.get("_invoice_file_url"), inv.get("_invoice_email_id"))
-            elif inv.get("upc"):       # Notion has no invoice line for it: look in the invoices mailbox by UPC
-                name, data, source = invoice_pdf.fetch_by_upc(inv["upc"])
+            mark = None                # the number to highlight on the invoice
+            try:
+                if inv.get("invoice_number"):
+                    name, data, source = invoice_pdf.fetch(inv["invoice_number"], inv.get("upc") or "",
+                                                           inv.get("_invoice_file_url"), inv.get("_invoice_email_id"))
+                elif inv.get("upc"):   # Notion has no invoice line for it: look in the invoices mailbox by UPC
+                    name, data, source = invoice_pdf.fetch_by_upc(inv["upc"])
+                    inv["invoice_number"] = re.sub(r"\.pdf$", "", name, flags=re.I)[:60] or "from mailbox"
+                    inv["invoice_price"] = Decimal(cost)
+                else:
+                    raise LookupError("this SKU has no UPC in Notion, so no invoice can be looked up")
+            except LookupError as first:
+                # Some suppliers (Spy) invoice under the item number that is written inside our SKU,
+                # e.g. *BUNDLE-SYDIRK- 672052973863-64 -> 672052973863. Search the invoices mailbox for that.
+                found = None
+                for number in sku_numbers(sku):
+                    try:
+                        found = invoice_pdf.fetch_by_upc(number)
+                        mark = number
+                        break
+                    except invoice_pdf.MailboxNotConnected:
+                        raise
+                    except LookupError:
+                        continue
+                if not found:
+                    tried = ", ".join(sku_numbers(sku))
+                    raise LookupError(str(first) + (f"; also searched for the item number in the SKU ({tried})"
+                                                    if tried else "")) from None
+                name, data, source = found
                 inv["invoice_number"] = re.sub(r"\.pdf$", "", name, flags=re.I)[:60] or "from mailbox"
                 inv["invoice_price"] = Decimal(cost)
-            else:
-                raise LookupError("this SKU has no UPC in Notion, so no invoice can be looked up")
+                inv["upc"] = mark
             data, hits = invoice_pdf.highlight(data, inv.get("upc") or "", inv.get("invoice_price"))
             fname = f"Invoice {inv['invoice_number']} - UPC {inv.get('upc') or 'unknown'}.pdf"
             _asana("POST", "/attachments", token, data={"parent": gid},
                    files={"file": (fname, data, "application/pdf")})
             if hits:
                 note = f"attached from {source}, UPC highlighted"
-                text = (f"Invoice {inv['invoice_number']} is attached with UPC {inv['upc']} highlighted. "
+                what = "item number" if mark else "UPC"
+                text = (f"Invoice {inv['invoice_number']} is attached with {what} {inv['upc']} highlighted. "
                         "Use this file as the proof of cost.")
             else:
                 note = f"attached from {source}, NOT highlighted (UPC text not found in the PDF)"
