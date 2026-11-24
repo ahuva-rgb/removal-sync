@@ -22,6 +22,8 @@ import ledger
 
 router = APIRouter(prefix="/agents/shipments", tags=["agent: shipments"])
 LOOKBACK_DAYS = int(os.environ.get("SHIPMENT_LOOKBACK_DAYS", "120"))
+MAX_ITEM_PAGES = int(os.environ.get("SHIPMENT_MAX_ITEM_PAGES", "1500"))
+PER_SHIPMENT_LIMIT = int(os.environ.get("SHIPMENT_PER_RUN_LIMIT", "120"))
 MAX_PAGES = int(os.environ.get("SHIPMENT_MAX_PAGES", "150"))
 _run_lock = threading.Lock()
 
@@ -103,6 +105,34 @@ def fetch_items(token: str, shipment_id: str) -> list[dict]:
     return out
 
 
+def fetch_all_items(token: str, since: datetime, until: datetime, progress=None) -> tuple[dict, str]:
+    """Items of every shipment updated in the window, in a few large pages: {shipment_id: [items]}."""
+    import main
+    by, tokens, pages, n = {}, set(), 0, 0
+    params = {"MarketplaceId": main.MARKETPLACE_ID, "QueryType": "DATE_RANGE",
+              "LastUpdatedAfter": since.strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "LastUpdatedBefore": until.strftime("%Y-%m-%dT%H:%M:%SZ")}
+    while True:
+        p = _get(token, "/fba/inbound/v0/shipmentItems", params)
+        pages += 1
+        items = p.get("ItemData", [])
+        for i in items:
+            by.setdefault(i.get("ShipmentId"), []).append(i)
+        n += len(items)
+        if progress:
+            progress(f"reading shipment items: page {pages}, {n} item lines so far")
+        nxt = p.get("NextToken")
+        if not nxt:
+            return by, "complete"
+        if nxt in tokens or not items:
+            return by, f"stopped at page {pages}: Amazon repeated a page"
+        if pages >= MAX_ITEM_PAGES:
+            return by, f"stopped at the {MAX_ITEM_PAGES}-page limit"
+        tokens.add(nxt)
+        params = {"MarketplaceId": main.MARKETPLACE_ID, "QueryType": "NEXT_TOKEN", "NextToken": nxt}
+        time.sleep(0.6)
+
+
 def totals(items: list[dict]) -> dict:
     """Pure: shipped / received / short / over for one shipment's items."""
     shipped = sum(int(i.get("QuantityShipped") or 0) for i in items)
@@ -135,20 +165,35 @@ def run(dry_run: bool = True) -> dict:
         with conn.cursor() as cur:
             cur.execute("SELECT shipment_id FROM inbound_shipments WHERE status='CLOSED' AND short_units = 0")
             settled = {r[0] for r in cur.fetchall()}        # closed and complete: no need to read it again
+        bulk, t0 = {}, time.time()
+        try:
+            bulk, how = fetch_all_items(token, now - timedelta(days=LOOKBACK_DAYS), now, progress)
+            summary.update(items_read="all at once", item_list=how, shipments_with_items=len(bulk))
+        except Exception as exc:      # that call is not available: read shipment by shipment, a batch per run
+            summary.update(items_read=f"one shipment at a time (bulk read failed: {str(exc)[:160]})")
+        summary["items_seconds"] = round(time.time() - t0)
+        single = 0
         for n, s in enumerate(shipments):
             sid = s["ShipmentId"]
             if sid in settled:
                 continue
-            if n % 10 == 0:
-                progress(f"reading items: shipment {n + 1} of {len(shipments)}")
-            try:
-                items = fetch_items(token, sid)
-                time.sleep(0.6)
-            except Exception as exc:
-                errors.append(f"{sid}: {exc}"[:200])
-                if len(errors) >= 5:
-                    break
-                continue
+            if sid in bulk:
+                items = bulk[sid]
+            else:
+                if single >= PER_SHIPMENT_LIMIT:
+                    summary["left_for_next_run"] = summary.get("left_for_next_run", 0) + 1
+                    continue
+                single += 1
+                if single % 10 == 1:
+                    progress(f"reading items one shipment at a time: {single} read, at {n + 1} of {len(shipments)}")
+                try:
+                    items = fetch_items(token, sid)
+                    time.sleep(0.6)
+                except Exception as exc:
+                    errors.append(f"{sid}: {exc}"[:200])
+                    if len(errors) >= 5:
+                        break
+                    continue
             t = totals(items)
             with conn.cursor() as cur:
                 cur.execute("""INSERT INTO inbound_shipments (shipment_id, name, status, destination_fc, shipped, received,
