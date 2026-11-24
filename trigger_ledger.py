@@ -41,4 +41,11 @@ if os.environ.get("PAYMENT_AGENT", "1") != "0":
         print("payment agent: request failed:", exc)
         ok = False
 
+if os.environ.get("SHIPMENT_AGENT", "1") != "0":
+    try:   # test mode: lists short shipments, creates nothing. Its result never fails the cron run.
+        r = requests.post(f"{url}/agents/shipments/run", headers=headers, timeout=120)
+        print("shipments agent:", r.status_code, r.text)
+    except requests.RequestException as exc:
+        print("shipments agent: request failed:", exc)
+
 sys.exit(0 if ok else 1)
