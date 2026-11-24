@@ -23,6 +23,9 @@ import ledger
 router = APIRouter(prefix="/agents/shipments", tags=["agent: shipments"])
 LOOKBACK_DAYS = int(os.environ.get("SHIPMENT_LOOKBACK_DAYS", "120"))
 MAX_ITEM_PAGES = int(os.environ.get("SHIPMENT_MAX_ITEM_PAGES", "1500"))
+ITEM_WINDOW_DAYS = int(os.environ.get("SHIPMENT_ITEM_WINDOW_DAYS", "45"))
+ITEM_LOOKBACK_DAYS = int(os.environ.get("SHIPMENT_ITEM_LOOKBACK_DAYS", "420"))
+SPOT_CHECKS = int(os.environ.get("SHIPMENT_SPOT_CHECKS", "8"))
 RUN_MINUTES = int(os.environ.get("SHIPMENT_RUN_MINUTES", "300"))   # a run stops here and the next one carries on
 MAX_PAGES = int(os.environ.get("SHIPMENT_MAX_PAGES", "150"))
 _run_lock = threading.Lock()
@@ -107,31 +110,40 @@ def fetch_items(token: str, shipment_id: str) -> list[dict]:
 
 
 def fetch_all_items(token: str, since: datetime, until: datetime, progress=None) -> tuple[dict, str]:
-    """Items of every shipment updated in the window, in a few large pages: {shipment_id: [items]}."""
+    """Every shipment item Amazon updated between `since` and `until`, read in large pages, window by window:
+    {shipment_id: {sku: item}}.  The window must reach back further than the shipments were CREATED, because
+    an item that was never received keeps its creation date - and those are exactly the short ones."""
     import main
-    by, tokens, pages, n = {}, set(), 0, 0
-    params = {"MarketplaceId": main.MARKETPLACE_ID, "QueryType": "DATE_RANGE",
-              "LastUpdatedAfter": since.strftime("%Y-%m-%dT%H:%M:%SZ"),
-              "LastUpdatedBefore": until.strftime("%Y-%m-%dT%H:%M:%SZ")}
-    while True:
-        p = _get(token, "/fba/inbound/v0/shipmentItems", params)
-        pages += 1
-        items = p.get("ItemData", [])
-        for i in items:
-            by.setdefault(i.get("ShipmentId"), []).append(i)
-        n += len(items)
-        if progress:
-            progress(f"reading shipment items: page {pages}, {n} item lines so far")
-        nxt = p.get("NextToken")
-        if not nxt:
-            return by, "complete"
-        if nxt in tokens or not items:
-            return by, f"stopped at page {pages}: Amazon repeated a page"
-        if pages >= MAX_ITEM_PAGES:
-            return by, f"stopped at the {MAX_ITEM_PAGES}-page limit"
-        tokens.add(nxt)
-        params = {"MarketplaceId": main.MARKETPLACE_ID, "QueryType": "NEXT_TOKEN", "NextToken": nxt}
-        time.sleep(0.6)
+    by, pages, n, notes = {}, 0, 0, []
+    end = until
+    while end > since:
+        start = max(since, end - timedelta(days=ITEM_WINDOW_DAYS))
+        tokens = set()
+        params = {"MarketplaceId": main.MARKETPLACE_ID, "QueryType": "DATE_RANGE",
+                  "LastUpdatedAfter": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                  "LastUpdatedBefore": end.strftime("%Y-%m-%dT%H:%M:%SZ")}
+        while True:
+            p = _get(token, "/fba/inbound/v0/shipmentItems", params)
+            pages += 1
+            items = p.get("ItemData", [])
+            for i in items:
+                by.setdefault(i.get("ShipmentId"), {})[i.get("SellerSKU") or ""] = i
+            n += len(items)
+            if progress and pages % 5 == 0:
+                progress(f"reading shipment items: page {pages}, {n} item lines, back to {start:%b %-d, %Y}")
+            nxt = p.get("NextToken")
+            if not nxt:
+                break
+            if nxt in tokens or not items:
+                notes.append(f"Amazon repeated a page in the window ending {end:%Y-%m-%d}")
+                break
+            if pages >= MAX_ITEM_PAGES:
+                return by, f"stopped at the {MAX_ITEM_PAGES}-page limit, back to {start:%Y-%m-%d}"
+            tokens.add(nxt)
+            params = {"MarketplaceId": main.MARKETPLACE_ID, "QueryType": "NEXT_TOKEN", "NextToken": nxt}
+            time.sleep(0.6)
+        end = start
+    return by, "; ".join(notes) or f"complete ({pages} pages, {n} item lines)"
 
 
 def totals(items: list[dict]) -> dict:
@@ -170,25 +182,51 @@ def run(dry_run: bool = True) -> dict:
                              AND (short_units = 0 OR synced_at > now() - interval '20 hours')""")
             settled = {r[0] for r in cur.fetchall()}
         deadline = time.time() + RUN_MINUTES * 60
+        bulk, t0 = {}, time.time()
+        try:
+            bulk, how = fetch_all_items(token, now - timedelta(days=ITEM_LOOKBACK_DAYS), now, progress)
+            summary.update(item_list=how, shipments_with_items=len(bulk))
+        except Exception as exc:
+            summary.update(item_list=f"bulk read failed: {str(exc)[:200]}")
+        summary["items_seconds"] = round(time.time() - t0)
+
+        # Spot check: read a few shipments the slow, exact way and compare with the bulk numbers.
+        checked, mismatches = 0, []
+        candidates = [x["ShipmentId"] for x in shipments if x["ShipmentId"] in bulk]
+        shorts = [c for c in candidates if totals(list(bulk[c].values()))["short_units"] > 0]
+        for sid in (shorts[:SPOT_CHECKS // 2] + [c for c in candidates if c not in shorts][:SPOT_CHECKS // 2]):
+            try:
+                exact, fast = totals(fetch_items(token, sid)), totals(list(bulk[sid].values()))
+                checked += 1
+                if exact != fast:
+                    mismatches.append({"shipment": sid, "exact": exact, "bulk": fast})
+            except Exception as exc:
+                mismatches.append({"shipment": sid, "error": str(exc)[:120]})
+        summary.update(spot_checked=checked, spot_mismatches=mismatches)
+        trust_bulk = checked > 0 and not mismatches
+
         read = 0
         for n, s in enumerate(shipments):
             sid = s["ShipmentId"]
             if sid in settled:
                 continue
-            if time.time() > deadline:
-                summary["left_for_next_run"] = summary.get("left_for_next_run", 0) + 1
-                continue
-            read += 1
-            if read % 10 == 1:
-                progress(f"reading items: {read} shipments read this run, at {n + 1} of {len(shipments)}")
-            try:
-                items = fetch_items(token, sid)
-                time.sleep(0.5)
-            except Exception as exc:
-                errors.append(f"{sid}: {exc}"[:200])
-                if len(errors) >= 5:
-                    break
-                continue
+            if trust_bulk and sid in bulk:
+                items = list(bulk[sid].values())
+            else:
+                if time.time() > deadline:
+                    summary["left_for_next_run"] = summary.get("left_for_next_run", 0) + 1
+                    continue
+                read += 1
+                if read % 5 == 1:
+                    progress(f"reading items one shipment at a time: {read} read, at {n + 1} of {len(shipments)}")
+                try:
+                    items = fetch_items(token, sid)
+                    time.sleep(0.5)
+                except Exception as exc:
+                    errors.append(f"{sid}: {exc}"[:200])
+                    if len(errors) >= 5:
+                        break
+                    continue
             t = totals(items)
             with conn.cursor() as cur:
                 cur.execute("""INSERT INTO inbound_shipments (shipment_id, name, status, destination_fc, shipped, received,
@@ -215,7 +253,7 @@ def run(dry_run: bool = True) -> dict:
             cur.execute("""SELECT count(*), count(*) FILTER (WHERE short_units > 0), coalesce(sum(short_units), 0)
                            FROM inbound_shipments WHERE status='CLOSED' AND complete_read""")
             done, n_short, units = cur.fetchone()
-        summary.update(read_this_run=read, shipments_checked_so_far=done, short_shipments=n_short,
+        summary.update(read_one_at_a_time=read, shipments_checked_so_far=done, short_shipments=n_short,
                        short_units=int(units), errors=errors)
         status = "ok" if not errors else "ok_with_errors"
         with conn.cursor() as cur:
