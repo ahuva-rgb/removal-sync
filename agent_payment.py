@@ -632,6 +632,8 @@ def attach_invoices(conn, token: str, upc_ids: dict | None = None, limit: int = 
                 else:
                     raise LookupError("this SKU has no UPC in Notion, so no invoice can be looked up")
             except LookupError as first:
+                if isinstance(first, invoice_pdf.MailboxNotConnected):
+                    raise              # could not look at all: try again next run, do not park the task
                 # Some suppliers (Spy) invoice under the item number that is written inside our SKU,
                 # e.g. *BUNDLE-SYDIRK- 672052973863-64 -> 672052973863. Search the invoices mailbox for that.
                 found = None
