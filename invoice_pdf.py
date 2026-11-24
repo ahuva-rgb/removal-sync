@@ -109,6 +109,11 @@ def fetch(invoice_number: str, upc: str, notion_file_url: str | None = None, ema
     raise LookupError("; ".join(reasons) or "no invoice number to look for")
 
 
+def _shows(text: str, number: str) -> bool:
+    """True when the PDF text contains the number, also when the PDF breaks it up with spaces."""
+    return number in text or number in re.sub(r"\s+", "", text)
+
+
 def fetch_by_upc(upc: str):
     """No invoice number known: search the invoices mailbox for a PDF that shows this UPC.
     Returns (filename, pdf bytes, where it came from) or raises LookupError."""
@@ -128,7 +133,7 @@ def fetch_by_upc(upc: str):
                 continue
             try:
                 data = google_mail.attachment(INVOICE_MAILBOX, mid, a["attachment_id"])
-                if _is_pdf(data) and len(data) <= MAX_PDF_BYTES and upc in pdf_text(data):
+                if _is_pdf(data) and len(data) <= MAX_PDF_BYTES and _shows(pdf_text(data), upc):
                     return a["filename"], data, f"a search of {INVOICE_MAILBOX} for the UPC"
             except Exception:
                 continue
