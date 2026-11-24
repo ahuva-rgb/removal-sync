@@ -15,6 +15,7 @@ import threading
 import time
 import traceback
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import requests
 from fastapi import APIRouter, Header, HTTPException
@@ -47,13 +48,17 @@ def ensure_tables(conn):
             CREATE TABLE IF NOT EXISTS shipment_board_refs (
                 shipment_id text NOT NULL, project_gid text, board text, task_gid text NOT NULL, section text,
                 completed boolean, in_name boolean, PRIMARY KEY (shipment_id, task_gid));
+            CREATE TABLE IF NOT EXISTS shipment_claims (
+                shipment_id text PRIMARY KEY, short_units int, claim_units int, asana_task_gid text,
+                task_created_at timestamptz, slip_attached_at timestamptz,
+                first_seen timestamptz NOT NULL DEFAULT now(), last_seen timestamptz NOT NULL DEFAULT now());
             CREATE TABLE IF NOT EXISTS shipment_agent_runs (
                 id bigserial PRIMARY KEY, started_at timestamptz NOT NULL DEFAULT now(), finished_at timestamptz,
                 status text NOT NULL, dry_run boolean, summary jsonb, error text);
         """)
         cur.execute("SELECT 1 FROM pg_roles WHERE rolname = 'ledger_reader'")
         if cur.fetchone():
-            cur.execute("GRANT SELECT ON inbound_shipments, inbound_shipment_items, shipment_agent_runs, shipment_board_refs TO ledger_reader")
+            cur.execute("GRANT SELECT ON inbound_shipments, inbound_shipment_items, shipment_agent_runs, shipment_board_refs, shipment_claims TO ledger_reader")
 
 
 BOARDS = {   # where a shipment may already have a task
@@ -102,6 +107,119 @@ def scan_boards(conn, token: str, progress=None) -> dict:
                            VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""", rows)
     out["shipment_ids_found"] = len({r[0] for r in rows})
     return out
+
+
+SHIPMENT_BOARD = "1211824376125946"
+TO_FILE_SECTION = os.environ.get("SHIPMENT_TO_FILE_SECTION", "1212738040759998")   # "1. To file: shipments that need reconciliation"
+ASSIGNEE = os.environ.get("ASANA_ASSIGNEE_GID", "1207717933464435")              # Azel
+MAX_TASKS = int(os.environ.get("SHIPMENT_MAX_TASKS", "40"))
+
+
+def live() -> bool:
+    return os.environ.get("SHIPMENT_AGENT_LIVE") == "1"
+
+
+CANDIDATES_SQL = """
+WITH re AS (SELECT fnsku, sum(quantity_reimbursed_total) q FROM fba_reimbursements
+            WHERE reason IN ('Lost_Inbound','Damaged_Inbound') AND approval_date >= current_date - 150 GROUP BY 1),
+it AS (SELECT i.shipment_id, i.fnsku, (i.shipped - i.received) short,
+              sum(i.shipped - i.received) OVER (PARTITION BY i.fnsku ORDER BY i.shipment_id) cum
+       FROM inbound_shipment_items i JOIN inbound_shipments s USING (shipment_id)
+       WHERE s.read_version >= 2 AND s.status = 'CLOSED' AND i.shipped > i.received),
+un AS (SELECT it.shipment_id, sum(greatest(least(it.short, it.cum - coalesce(re.q, 0)), 0)) uncovered, sum(it.short) short
+       FROM it LEFT JOIN re USING (fnsku) GROUP BY 1)
+SELECT u.shipment_id, s.name, s.destination_fc, s.shipped, s.received, u.short, s.over_units,
+       greatest(u.uncovered - s.over_units, 0)::int AS claim_units
+FROM un u JOIN inbound_shipments s USING (shipment_id)
+WHERE greatest(u.uncovered - s.over_units, 0) > 0
+  AND u.shipment_id NOT IN (SELECT shipment_id FROM shipment_board_refs)
+  AND u.shipment_id NOT IN (SELECT shipment_id FROM shipment_claims WHERE asana_task_gid IS NOT NULL)
+ORDER BY 8 DESC, 1"""
+
+
+def shipment_items(conn, shipment_id: str) -> list[dict]:
+    with conn.cursor() as cur:
+        cur.execute("""SELECT i.sku, i.fnsku, i.shipped, i.received,
+                              (SELECT max(l.title) FROM ledger_detail l
+                               WHERE l.fnsku = i.fnsku AND l.event_date > current_date - 400)
+                       FROM inbound_shipment_items i WHERE i.shipment_id = %s ORDER BY i.sku""", (shipment_id,))
+        return [{"sku": a, "fnsku": b, "shipped": c, "received": d, "title": (e or "").split(" | ")[0][:110]}
+                for a, b, c, d, e in cur.fetchall()]
+
+
+def task_fields(c: dict, items: list[dict]) -> dict:
+    """Pure: the Asana task for one short shipment."""
+    short = [i for i in items if i["shipped"] > i["received"]]
+    lines = [f"- {i['sku']} | FNSKU {i['fnsku']} | shipped {i['shipped']}, received {i['received']}, "
+             f"short {i['shipped'] - i['received']}" for i in short]
+    notes = ["STEPS",
+             "1. Open the shipment in Seller Central and start the reconciliation / missing units case for the items below.",
+             "2. Attach the packing slip that is on this task as the proof of what was shipped.",
+             "3. Put the Amazon case number in the Case ID field and move the task to \"2. Case submitted\".",
+             "",
+             f"Shipment: {c['shipment_id']}  ({c['name']})",
+             f"Amazon warehouse: {c['destination_fc']}",
+             f"Units shipped: {c['shipped']}   Units received: {c['received']}   Units short: {c['short']}",
+             f"Units to claim: {c['claim_units']}  (short units that Amazon has not already reimbursed"
+             + (f", less {c['over_units']} extra unit(s) Amazon received on this shipment)" if c["over_units"] else ")"),
+             "",
+             "ITEMS SHORT", *lines,
+             "",
+             "Note: \"units to claim\" is the agent's estimate. Amazon's reimbursement report does not name the "
+             "shipment, so if the shipment page shows a different number of missing units, go by the shipment page."]
+    due = (datetime.now(timezone.utc).astimezone(ZoneInfo("America/New_York")) + timedelta(days=1)).date()
+    return {"name": f"Short shipment | {c['shipment_id']} | {c['name']} | {c['claim_units']} unit(s) to claim",
+            "notes": "\n".join(notes), "due_on": str(due)}
+
+
+def _asana(method: str, path: str, token: str, **kw) -> dict:
+    r = requests.request(method, f"https://app.asana.com/api/1.0{path}", headers={"Authorization": f"Bearer {token}"},
+                         timeout=90, **kw)
+    if not r.ok:
+        raise RuntimeError(f"Asana {r.status_code}: {r.text[:300]}")
+    return r.json()["data"]
+
+
+def make_tasks(conn, token: str, apply: bool) -> dict:
+    """Plan (and, when live, create) a task with its packing slip for every short shipment that has none."""
+    import packing_slip
+    with conn.cursor() as cur:
+        cur.execute(CANDIDATES_SQL)
+        cols = ["shipment_id", "name", "destination_fc", "shipped", "received", "short", "over_units", "claim_units"]
+        cands = [dict(zip(cols, r)) for r in cur.fetchall()]
+    planned, created, errors = [], 0, []
+    for c in cands:
+        items = shipment_items(conn, c["shipment_id"])
+        f = task_fields(c, items)
+        planned.append({"task": f["name"], "items_on_slip": len(items), "units_on_slip": sum(i["shipped"] for i in items)})
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO shipment_claims (shipment_id, short_units, claim_units) VALUES (%s,%s,%s)
+                           ON CONFLICT (shipment_id) DO UPDATE SET short_units=EXCLUDED.short_units,
+                             claim_units=EXCLUDED.claim_units, last_seen=now()""",
+                        (c["shipment_id"], c["short"], c["claim_units"]))
+        if not apply or created >= MAX_TASKS:
+            continue
+        try:
+            pdf = packing_slip.build(c["shipment_id"], c["name"], c["destination_fc"],
+                                     [(i["sku"], i["title"], i["shipped"], i["fnsku"]) for i in items])
+            data = {**f, "projects": [SHIPMENT_BOARD], "memberships": [{"project": SHIPMENT_BOARD, "section": TO_FILE_SECTION}]}
+            if ASSIGNEE and ASSIGNEE.lower() != "none":
+                data["assignee"] = ASSIGNEE
+            gid = _asana("POST", "/tasks", token, json={"data": data})["gid"]
+            with conn.cursor() as cur:      # remember it first, so a failed upload can never lead to a second task
+                cur.execute("UPDATE shipment_claims SET asana_task_gid=%s, task_created_at=now() WHERE shipment_id=%s",
+                            (gid, c["shipment_id"]))
+            _asana("POST", "/attachments", token, data={"parent": gid},
+                   files={"file": (f"Packing Slip {c['shipment_id']}.pdf", pdf, "application/pdf")})
+            with conn.cursor() as cur:
+                cur.execute("UPDATE shipment_claims SET slip_attached_at=now() WHERE shipment_id=%s", (c["shipment_id"],))
+            created += 1
+        except Exception as exc:
+            errors.append(f"{c['shipment_id']}: {exc}"[:200])
+            if len(errors) >= 3:
+                break
+    return {"live": apply, "candidates": len(cands), "units_to_claim": sum(c["claim_units"] for c in cands),
+            "tasks_created": created, "task_errors": errors, "planned": planned}
 
 
 def _get(token: str, path: str, params: dict) -> dict:
@@ -222,7 +340,7 @@ def run(dry_run: bool = True) -> dict:
         cur.execute("UPDATE shipment_agent_runs SET status='interrupted', finished_at=now() WHERE status='running'")
         cur.execute("INSERT INTO shipment_agent_runs (status, dry_run) VALUES ('running', true) RETURNING id")
         run_id = cur.fetchone()[0]
-    summary = {"test_mode": True, "lookback_days": LOOKBACK_DAYS}
+    summary = {"test_mode": not live(), "lookback_days": LOOKBACK_DAYS}
     try:
         token = main.lwa_token()
         now = datetime.now(timezone.utc)
@@ -314,6 +432,13 @@ def run(dry_run: bool = True) -> dict:
                 summary["boards"] = scan_boards(conn, os.environ["ASANA_TOKEN"], progress)
             except Exception as exc:
                 summary["boards_error"] = f"{type(exc).__name__}: {exc}"[:300]
+        boards_ok = isinstance(summary.get("boards"), dict) and not any(
+            str(v).startswith("could not read") for v in summary["boards"].values())
+        if boards_ok:      # never plan or create tasks on a day the boards could not be checked
+            progress("working out which short shipments need a task")
+            summary["tasks"] = make_tasks(conn, os.environ["ASANA_TOKEN"], apply=live())
+        else:
+            summary["tasks"] = "skipped: the boards could not be checked, so no task was planned or created"
         with conn.cursor() as cur:
             cur.execute("""SELECT count(*), count(*) FILTER (WHERE short_units > 0), coalesce(sum(short_units), 0)
                            FROM inbound_shipments WHERE status='CLOSED' AND read_version >= 2""")
