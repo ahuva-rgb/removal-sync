@@ -39,6 +39,7 @@ def ensure_tables(conn):
                 shipped int, received int, short_units int, over_units int,
                 first_seen_closed timestamptz, synced_at timestamptz NOT NULL DEFAULT now());
             ALTER TABLE inbound_shipments ADD COLUMN IF NOT EXISTS complete_read boolean NOT NULL DEFAULT false;
+            ALTER TABLE inbound_shipments ADD COLUMN IF NOT EXISTS read_version int NOT NULL DEFAULT 0;
             CREATE TABLE IF NOT EXISTS inbound_shipment_items (
                 shipment_id text NOT NULL, sku text NOT NULL, fnsku text, shipped int, received int,
                 PRIMARY KEY (shipment_id, sku));
@@ -95,18 +96,24 @@ def fetch_closed_shipments(token: str, since: datetime, until: datetime, progres
 
 
 def fetch_items(token: str, shipment_id: str) -> list[dict]:
+    """All items of one shipment, one line per SKU. Amazon keeps handing back a NextToken for this call and
+    then repeats the same page, so stop as soon as a page brings nothing new."""
     import main
-    out, tokens, params = [], set(), {"MarketplaceId": main.MARKETPLACE_ID}
-    for _ in range(200):
+    by, tokens, params = {}, set(), {"MarketplaceId": main.MARKETPLACE_ID}
+    for _ in range(60):
         p = _get(token, f"/fba/inbound/v0/shipments/{shipment_id}/items", params)
-        out += p.get("ItemData", [])
+        new = 0
+        for i in p.get("ItemData", []):
+            k = i.get("SellerSKU") or ""
+            new += k not in by
+            by[k] = i
         nxt = p.get("NextToken")
-        if not nxt or nxt in tokens:
+        if not nxt or nxt in tokens or not new:
             break
         tokens.add(nxt)
         params = {"MarketplaceId": main.MARKETPLACE_ID, "NextToken": nxt}
         time.sleep(0.5)
-    return out
+    return list(by.values())
 
 
 def fetch_all_items(token: str, since: datetime, until: datetime, progress=None) -> tuple[dict, str]:
@@ -178,7 +185,7 @@ def run(dry_run: bool = True) -> dict:
         with conn.cursor() as cur:
             # closed and fully received: never read again.  Still short: read again once a day.
             cur.execute("""SELECT shipment_id FROM inbound_shipments
-                           WHERE status='CLOSED' AND complete_read
+                           WHERE status='CLOSED' AND complete_read AND read_version >= 2
                              AND (short_units = 0 OR synced_at > now() - interval '20 hours')""")
             settled = {r[0] for r in cur.fetchall()}
         deadline = time.time() + RUN_MINUTES * 60
@@ -230,12 +237,12 @@ def run(dry_run: bool = True) -> dict:
             t = totals(items)
             with conn.cursor() as cur:
                 cur.execute("""INSERT INTO inbound_shipments (shipment_id, name, status, destination_fc, shipped, received,
-                                                              short_units, over_units, first_seen_closed, complete_read)
-                               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,now(),true)
+                                                              short_units, over_units, first_seen_closed, complete_read, read_version)
+                               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,now(),true,2)
                                ON CONFLICT (shipment_id) DO UPDATE SET name=EXCLUDED.name, status=EXCLUDED.status,
                                  destination_fc=EXCLUDED.destination_fc, shipped=EXCLUDED.shipped, received=EXCLUDED.received,
                                  short_units=EXCLUDED.short_units, over_units=EXCLUDED.over_units, synced_at=now(),
-                                 complete_read=true""",
+                                 complete_read=true, read_version=2""",
                             (sid, s.get("ShipmentName"), s.get("ShipmentStatus"), s.get("DestinationFulfillmentCenterId"),
                              t["shipped"], t["received"], t["short_units"], t["over_units"]))
                 cur.execute("DELETE FROM inbound_shipment_items WHERE shipment_id=%s", (sid,))
@@ -251,7 +258,7 @@ def run(dry_run: bool = True) -> dict:
                 short_list.append({"shipment_id": sid, "name": s.get("ShipmentName"), **t})
         with conn.cursor() as cur:
             cur.execute("""SELECT count(*), count(*) FILTER (WHERE short_units > 0), coalesce(sum(short_units), 0)
-                           FROM inbound_shipments WHERE status='CLOSED' AND complete_read""")
+                           FROM inbound_shipments WHERE status='CLOSED' AND read_version >= 2""")
             done, n_short, units = cur.fetchone()
         summary.update(read_one_at_a_time=read, shipments_checked_so_far=done, short_shipments=n_short,
                        short_units=int(units), errors=errors)
