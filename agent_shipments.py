@@ -23,7 +23,7 @@ import ledger
 router = APIRouter(prefix="/agents/shipments", tags=["agent: shipments"])
 LOOKBACK_DAYS = int(os.environ.get("SHIPMENT_LOOKBACK_DAYS", "120"))
 MAX_ITEM_PAGES = int(os.environ.get("SHIPMENT_MAX_ITEM_PAGES", "1500"))
-PER_SHIPMENT_LIMIT = int(os.environ.get("SHIPMENT_PER_RUN_LIMIT", "120"))
+RUN_MINUTES = int(os.environ.get("SHIPMENT_RUN_MINUTES", "300"))   # a run stops here and the next one carries on
 MAX_PAGES = int(os.environ.get("SHIPMENT_MAX_PAGES", "150"))
 _run_lock = threading.Lock()
 
@@ -35,6 +35,7 @@ def ensure_tables(conn):
                 shipment_id text PRIMARY KEY, name text, status text, destination_fc text,
                 shipped int, received int, short_units int, over_units int,
                 first_seen_closed timestamptz, synced_at timestamptz NOT NULL DEFAULT now());
+            ALTER TABLE inbound_shipments ADD COLUMN IF NOT EXISTS complete_read boolean NOT NULL DEFAULT false;
             CREATE TABLE IF NOT EXISTS inbound_shipment_items (
                 shipment_id text NOT NULL, sku text NOT NULL, fnsku text, shipped int, received int,
                 PRIMARY KEY (shipment_id, sku));
@@ -93,7 +94,7 @@ def fetch_closed_shipments(token: str, since: datetime, until: datetime, progres
 def fetch_items(token: str, shipment_id: str) -> list[dict]:
     import main
     out, tokens, params = [], set(), {"MarketplaceId": main.MARKETPLACE_ID}
-    for _ in range(40):
+    for _ in range(200):
         p = _get(token, f"/fba/inbound/v0/shipments/{shipment_id}/items", params)
         out += p.get("ItemData", [])
         nxt = p.get("NextToken")
@@ -101,7 +102,7 @@ def fetch_items(token: str, shipment_id: str) -> list[dict]:
             break
         tokens.add(nxt)
         params = {"MarketplaceId": main.MARKETPLACE_ID, "NextToken": nxt}
-        time.sleep(0.6)
+        time.sleep(0.5)
     return out
 
 
@@ -163,45 +164,40 @@ def run(dry_run: bool = True) -> dict:
         summary.update(closed_shipments=len(shipments), shipment_list=paging)
         short_list, errors = [], []
         with conn.cursor() as cur:
-            cur.execute("SELECT shipment_id FROM inbound_shipments WHERE status='CLOSED' AND short_units = 0")
-            settled = {r[0] for r in cur.fetchall()}        # closed and complete: no need to read it again
-        bulk, t0 = {}, time.time()
-        try:
-            bulk, how = fetch_all_items(token, now - timedelta(days=LOOKBACK_DAYS), now, progress)
-            summary.update(items_read="all at once", item_list=how, shipments_with_items=len(bulk))
-        except Exception as exc:      # that call is not available: read shipment by shipment, a batch per run
-            summary.update(items_read=f"one shipment at a time (bulk read failed: {str(exc)[:160]})")
-        summary["items_seconds"] = round(time.time() - t0)
-        single = 0
+            # closed and fully received: never read again.  Still short: read again once a day.
+            cur.execute("""SELECT shipment_id FROM inbound_shipments
+                           WHERE status='CLOSED' AND complete_read
+                             AND (short_units = 0 OR synced_at > now() - interval '20 hours')""")
+            settled = {r[0] for r in cur.fetchall()}
+        deadline = time.time() + RUN_MINUTES * 60
+        read = 0
         for n, s in enumerate(shipments):
             sid = s["ShipmentId"]
             if sid in settled:
                 continue
-            if sid in bulk:
-                items = bulk[sid]
-            else:
-                if single >= PER_SHIPMENT_LIMIT:
-                    summary["left_for_next_run"] = summary.get("left_for_next_run", 0) + 1
-                    continue
-                single += 1
-                if single % 10 == 1:
-                    progress(f"reading items one shipment at a time: {single} read, at {n + 1} of {len(shipments)}")
-                try:
-                    items = fetch_items(token, sid)
-                    time.sleep(0.6)
-                except Exception as exc:
-                    errors.append(f"{sid}: {exc}"[:200])
-                    if len(errors) >= 5:
-                        break
-                    continue
+            if time.time() > deadline:
+                summary["left_for_next_run"] = summary.get("left_for_next_run", 0) + 1
+                continue
+            read += 1
+            if read % 10 == 1:
+                progress(f"reading items: {read} shipments read this run, at {n + 1} of {len(shipments)}")
+            try:
+                items = fetch_items(token, sid)
+                time.sleep(0.5)
+            except Exception as exc:
+                errors.append(f"{sid}: {exc}"[:200])
+                if len(errors) >= 5:
+                    break
+                continue
             t = totals(items)
             with conn.cursor() as cur:
                 cur.execute("""INSERT INTO inbound_shipments (shipment_id, name, status, destination_fc, shipped, received,
-                                                              short_units, over_units, first_seen_closed)
-                               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,now())
+                                                              short_units, over_units, first_seen_closed, complete_read)
+                               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,now(),true)
                                ON CONFLICT (shipment_id) DO UPDATE SET name=EXCLUDED.name, status=EXCLUDED.status,
                                  destination_fc=EXCLUDED.destination_fc, shipped=EXCLUDED.shipped, received=EXCLUDED.received,
-                                 short_units=EXCLUDED.short_units, over_units=EXCLUDED.over_units, synced_at=now()""",
+                                 short_units=EXCLUDED.short_units, over_units=EXCLUDED.over_units, synced_at=now(),
+                                 complete_read=true""",
                             (sid, s.get("ShipmentName"), s.get("ShipmentStatus"), s.get("DestinationFulfillmentCenterId"),
                              t["shipped"], t["received"], t["short_units"], t["over_units"]))
                 cur.execute("DELETE FROM inbound_shipment_items WHERE shipment_id=%s", (sid,))
@@ -211,13 +207,16 @@ def run(dry_run: bool = True) -> dict:
                     a = agg.setdefault(k, [i.get("FulfillmentNetworkSKU"), 0, 0])
                     a[1] += int(i.get("QuantityShipped") or 0)
                     a[2] += int(i.get("QuantityReceived") or 0)
-                for sku, (fnsku, sh, rc) in agg.items():
-                    cur.execute("INSERT INTO inbound_shipment_items (shipment_id, sku, fnsku, shipped, received) "
-                                "VALUES (%s,%s,%s,%s,%s)", (sid, sku, fnsku, sh, rc))
+                cur.executemany("INSERT INTO inbound_shipment_items (shipment_id, sku, fnsku, shipped, received) "
+                                "VALUES (%s,%s,%s,%s,%s)", [(sid, sku, f, sh, rc) for sku, (f, sh, rc) in agg.items()])
             if t["short_units"] > 0:
                 short_list.append({"shipment_id": sid, "name": s.get("ShipmentName"), **t})
-        summary.update(short_shipments=len(short_list), short_units=sum(x["short_units"] for x in short_list),
-                       errors=errors)
+        with conn.cursor() as cur:
+            cur.execute("""SELECT count(*), count(*) FILTER (WHERE short_units > 0), coalesce(sum(short_units), 0)
+                           FROM inbound_shipments WHERE status='CLOSED' AND complete_read""")
+            done, n_short, units = cur.fetchone()
+        summary.update(read_this_run=read, shipments_checked_so_far=done, short_shipments=n_short,
+                       short_units=int(units), errors=errors)
         status = "ok" if not errors else "ok_with_errors"
         with conn.cursor() as cur:
             cur.execute("UPDATE shipment_agent_runs SET status=%s, finished_at=now(), summary=%s WHERE id=%s",
