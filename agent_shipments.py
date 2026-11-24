@@ -22,6 +22,7 @@ import ledger
 
 router = APIRouter(prefix="/agents/shipments", tags=["agent: shipments"])
 LOOKBACK_DAYS = int(os.environ.get("SHIPMENT_LOOKBACK_DAYS", "120"))
+MAX_PAGES = int(os.environ.get("SHIPMENT_MAX_PAGES", "150"))
 _run_lock = threading.Lock()
 
 
@@ -58,30 +59,48 @@ def _get(token: str, path: str, params: dict) -> dict:
     raise RuntimeError(f"Amazon kept answering 429 on {path}")
 
 
-def fetch_closed_shipments(token: str, since: datetime, until: datetime) -> list[dict]:
+def fetch_closed_shipments(token: str, since: datetime, until: datetime, progress=None) -> tuple[list[dict], str]:
+    """Closed shipments updated in the window. Returns (shipments, how the paging ended).
+    Guards against Amazon handing back the same page forever."""
     import main
-    out, params = [], {"MarketplaceId": main.MARKETPLACE_ID, "QueryType": "DATE_RANGE", "ShipmentStatusList": "CLOSED",
-                       "LastUpdatedAfter": since.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                       "LastUpdatedBefore": until.strftime("%Y-%m-%dT%H:%M:%SZ")}
+    seen, out, tokens, pages = set(), [], set(), 0
+    params = {"MarketplaceId": main.MARKETPLACE_ID, "QueryType": "DATE_RANGE", "ShipmentStatusList": "CLOSED",
+              "LastUpdatedAfter": since.strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "LastUpdatedBefore": until.strftime("%Y-%m-%dT%H:%M:%SZ")}
     while True:
         p = _get(token, "/fba/inbound/v0/shipments", params)
-        out += p.get("ShipmentData", [])
-        if not p.get("NextToken"):
-            return out
-        params = {"MarketplaceId": main.MARKETPLACE_ID, "QueryType": "NEXT_TOKEN", "NextToken": p["NextToken"]}
+        pages += 1
+        new = [x for x in p.get("ShipmentData", []) if x.get("ShipmentId") not in seen]
+        for x in new:
+            seen.add(x["ShipmentId"])
+        out += new
+        if progress:
+            progress(f"reading the shipment list: page {pages}, {len(out)} closed shipments so far")
+        nxt = p.get("NextToken")
+        if not nxt:
+            return out, "complete"
+        if nxt in tokens or not new:
+            return out, f"stopped at page {pages}: Amazon repeated a page"
+        if pages >= MAX_PAGES:
+            return out, f"stopped at the {MAX_PAGES}-page limit"
+        tokens.add(nxt)
+        params = {"MarketplaceId": main.MARKETPLACE_ID, "QueryType": "NEXT_TOKEN", "NextToken": nxt}
         time.sleep(0.6)
 
 
 def fetch_items(token: str, shipment_id: str) -> list[dict]:
     import main
-    out, params = [], {"MarketplaceId": main.MARKETPLACE_ID}
-    while True:
+    out, tokens, params = [], set(), {"MarketplaceId": main.MARKETPLACE_ID}
+    for _ in range(40):
         p = _get(token, f"/fba/inbound/v0/shipments/{shipment_id}/items", params)
         out += p.get("ItemData", [])
-        if not p.get("NextToken"):
-            return out
-        params = {"MarketplaceId": main.MARKETPLACE_ID, "NextToken": p["NextToken"]}
+        nxt = p.get("NextToken")
+        if not nxt or nxt in tokens:
+            break
+        tokens.add(nxt)
+        params = {"MarketplaceId": main.MARKETPLACE_ID, "NextToken": nxt}
         time.sleep(0.6)
+    return out
 
 
 def totals(items: list[dict]) -> dict:
@@ -105,16 +124,23 @@ def run(dry_run: bool = True) -> dict:
     try:
         token = main.lwa_token()
         now = datetime.now(timezone.utc)
-        shipments = fetch_closed_shipments(token, now - timedelta(days=LOOKBACK_DAYS), now)
-        summary["closed_shipments"] = len(shipments)
+        def progress(step: str):
+            with conn.cursor() as cur:
+                cur.execute("UPDATE shipment_agent_runs SET summary=%s WHERE id=%s",
+                            (json.dumps({**summary, "step": step}, default=str), run_id))
+
+        shipments, paging = fetch_closed_shipments(token, now - timedelta(days=LOOKBACK_DAYS), now, progress)
+        summary.update(closed_shipments=len(shipments), shipment_list=paging)
         short_list, errors = [], []
         with conn.cursor() as cur:
             cur.execute("SELECT shipment_id FROM inbound_shipments WHERE status='CLOSED' AND short_units = 0")
             settled = {r[0] for r in cur.fetchall()}        # closed and complete: no need to read it again
-        for s in shipments:
+        for n, s in enumerate(shipments):
             sid = s["ShipmentId"]
             if sid in settled:
                 continue
+            if n % 10 == 0:
+                progress(f"reading items: shipment {n + 1} of {len(shipments)}")
             try:
                 items = fetch_items(token, sid)
                 time.sleep(0.6)
