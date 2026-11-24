@@ -312,6 +312,12 @@ try:
 except Exception as _agent_payment_exc:  # pragma: no cover
     print(f"payment accuracy agent not mounted: {type(_agent_payment_exc).__name__}: {_agent_payment_exc}")
 
+try:
+    from agent_shipments import router as agent_shipments_router
+    app.include_router(agent_shipments_router)
+except Exception as _agent_shipments_exc:  # pragma: no cover
+    print(f"shipments agent not mounted: {type(_agent_shipments_exc).__name__}: {_agent_shipments_exc}")
+
 # Read-only "Ledger" connector for Claude (see mcp_ledger.py).
 try:
     from mcp_ledger import router as mcp_ledger_router
