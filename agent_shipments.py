@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 import traceback
@@ -43,13 +44,64 @@ def ensure_tables(conn):
             CREATE TABLE IF NOT EXISTS inbound_shipment_items (
                 shipment_id text NOT NULL, sku text NOT NULL, fnsku text, shipped int, received int,
                 PRIMARY KEY (shipment_id, sku));
+            CREATE TABLE IF NOT EXISTS shipment_board_refs (
+                shipment_id text NOT NULL, project_gid text, board text, task_gid text NOT NULL, section text,
+                completed boolean, in_name boolean, PRIMARY KEY (shipment_id, task_gid));
             CREATE TABLE IF NOT EXISTS shipment_agent_runs (
                 id bigserial PRIMARY KEY, started_at timestamptz NOT NULL DEFAULT now(), finished_at timestamptz,
                 status text NOT NULL, dry_run boolean, summary jsonb, error text);
         """)
         cur.execute("SELECT 1 FROM pg_roles WHERE rolname = 'ledger_reader'")
         if cur.fetchone():
-            cur.execute("GRANT SELECT ON inbound_shipments, inbound_shipment_items, shipment_agent_runs TO ledger_reader")
+            cur.execute("GRANT SELECT ON inbound_shipments, inbound_shipment_items, shipment_agent_runs, shipment_board_refs TO ledger_reader")
+
+
+BOARDS = {   # where a shipment may already have a task
+    "1211824376125946": "New Shipment Reconciliation",
+    "1220620863326159": "Reimbursements to File",
+    "1220818804510392": "Reimbursement Case Discrepancy",
+    "1211663281581349": "Reimbursement Case Discrepancy (old)",
+}
+_SHIPMENT_ID = re.compile(r"FBA[0-9A-Z]{8,10}")
+
+
+def scan_boards(conn, token: str, progress=None) -> dict:
+    """Record every shipment ID that appears in a task name or description on the boards (open or completed)."""
+    out, rows = {}, []
+    for gid, label in BOARDS.items():
+        params = {"limit": 100, "opt_fields": "name,notes,completed,memberships.section.name,memberships.project.gid"}
+        n = 0
+        try:
+            while True:
+                r = requests.get(f"https://app.asana.com/api/1.0/projects/{gid}/tasks", params=params, timeout=60,
+                                 headers={"Authorization": f"Bearer {token}"})
+                if r.status_code == 429:
+                    time.sleep(float(r.headers.get("Retry-After", 5)))
+                    continue
+                r.raise_for_status()
+                j = r.json()
+                for t in j["data"]:
+                    n += 1
+                    ids = set(_SHIPMENT_ID.findall((t.get("name") or "").upper() + " " + (t.get("notes") or "").upper()))
+                    sec = next(((m.get("section") or {}).get("name") for m in t.get("memberships", [])
+                                if (m.get("project") or {}).get("gid") == gid), None)
+                    in_name = set(_SHIPMENT_ID.findall((t.get("name") or "").upper()))
+                    rows += [(sid, gid, label, t["gid"], sec, bool(t.get("completed")), sid in in_name) for sid in ids]
+                if progress and n % 1000 == 0:
+                    progress(f"checking the boards: {label}, {n} tasks read")
+                nxt = (j.get("next_page") or {}).get("offset")
+                if not nxt:
+                    break
+                params["offset"] = nxt
+            out[label] = n
+        except Exception as exc:
+            out[label] = f"could not read: {str(exc)[:120]}"
+    with conn.transaction(), conn.cursor() as cur:
+        cur.execute("DELETE FROM shipment_board_refs")
+        cur.executemany("""INSERT INTO shipment_board_refs (shipment_id, project_gid, board, task_gid, section, completed, in_name)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""", rows)
+    out["shipment_ids_found"] = len({r[0] for r in rows})
+    return out
 
 
 def _get(token: str, path: str, params: dict) -> dict:
@@ -256,6 +308,12 @@ def run(dry_run: bool = True) -> dict:
                                 "VALUES (%s,%s,%s,%s,%s)", [(sid, sku, f, sh, rc) for sku, (f, sh, rc) in agg.items()])
             if t["short_units"] > 0:
                 short_list.append({"shipment_id": sid, "name": s.get("ShipmentName"), **t})
+        if os.environ.get("ASANA_TOKEN"):
+            progress("checking the boards for existing shipment tasks")
+            try:
+                summary["boards"] = scan_boards(conn, os.environ["ASANA_TOKEN"], progress)
+            except Exception as exc:
+                summary["boards_error"] = f"{type(exc).__name__}: {exc}"[:300]
         with conn.cursor() as cur:
             cur.execute("""SELECT count(*), count(*) FILTER (WHERE short_units > 0), coalesce(sum(short_units), 0)
                            FROM inbound_shipments WHERE status='CLOSED' AND read_version >= 2""")

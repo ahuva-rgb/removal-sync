@@ -37,7 +37,7 @@ TABLES = ("ledger_detail", "ledger_summary", "ledger_sync_runs", "ledger_loaded_
 EXTRA_TABLES = ("fba_reimbursements", "fba_customer_returns", "claims_sync_runs",
                 "payment_claims", "payment_agent_runs", "sku_costs", "sku_cost_uploads",
                 "amazon_sourcing_costs", "amazon_cost_files", "case_emails",
-                "inbound_shipments", "inbound_shipment_items", "shipment_agent_runs")
+                "inbound_shipments", "inbound_shipment_items", "shipment_agent_runs", "shipment_board_refs")
 EXTRA_DATE_COLS = {"fba_reimbursements": "approval_date", "fba_customer_returns": "return_date"}
 MAX_ROWS = 2000
 SUPPORTED_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
