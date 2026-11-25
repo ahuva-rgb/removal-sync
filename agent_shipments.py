@@ -52,13 +52,16 @@ def ensure_tables(conn):
                 shipment_id text PRIMARY KEY, short_units int, claim_units int, asana_task_gid text,
                 task_created_at timestamptz, slip_attached_at timestamptz,
                 first_seen timestamptz NOT NULL DEFAULT now(), last_seen timestamptz NOT NULL DEFAULT now());
+            CREATE TABLE IF NOT EXISTS shipment_cases (
+                task_gid text PRIMARY KEY, shipment_id text, case_id text, sas_case_id text, submitted_at timestamptz,
+                section text, state text, note text, last_seen timestamptz NOT NULL DEFAULT now());
             CREATE TABLE IF NOT EXISTS shipment_agent_runs (
                 id bigserial PRIMARY KEY, started_at timestamptz NOT NULL DEFAULT now(), finished_at timestamptz,
                 status text NOT NULL, dry_run boolean, summary jsonb, error text);
         """)
         cur.execute("SELECT 1 FROM pg_roles WHERE rolname = 'ledger_reader'")
         if cur.fetchone():
-            cur.execute("GRANT SELECT ON inbound_shipments, inbound_shipment_items, shipment_agent_runs, shipment_board_refs, shipment_claims TO ledger_reader")
+            cur.execute("GRANT SELECT ON inbound_shipments, inbound_shipment_items, shipment_agent_runs, shipment_board_refs, shipment_claims, shipment_cases TO ledger_reader")
 
 
 BOARDS = {   # where a shipment may already have a task
@@ -220,6 +223,179 @@ def make_tasks(conn, token: str, apply: bool) -> dict:
                 break
     return {"live": apply, "candidates": len(cands), "units_to_claim": sum(c["claim_units"] for c in cands),
             "tasks_created": created, "task_errors": errors, "planned": planned}
+
+
+# ------------------------------------------------------------ case watching ---
+WAIT_DAYS = int(os.environ.get("SHIPMENT_CASE_WAIT_DAYS", "14"))    # still open and unpaid after this -> SAS
+CASES_MAILBOX = os.environ.get("CASES_MAILBOX", "cases@gefenoptical.com")
+_DENIED = ("unable to", "not eligible", "cannot reimburse", "can't reimburse", "will not be reimburs", "no reimbursement",
+           "completed our investigation", "investigation is complete", "have been accounted for", "declin", "denied",
+           "not able to", "no further action", "claim window", "does not qualify")
+UNPAID_SQL = """
+WITH re AS (SELECT fnsku, sum(quantity_reimbursed_total) q FROM fba_reimbursements
+            WHERE reason IN ('Lost_Inbound','Damaged_Inbound') AND approval_date >= current_date - 150 GROUP BY 1),
+it AS (SELECT i.shipment_id, i.fnsku, (i.shipped - i.received) short,
+              sum(i.shipped - i.received) OVER (PARTITION BY i.fnsku ORDER BY i.shipment_id) cum
+       FROM inbound_shipment_items i JOIN inbound_shipments s USING (shipment_id)
+       WHERE s.read_version >= 2 AND i.shipped > i.received)
+SELECT s.shipment_id, coalesce(sum(greatest(least(it.short, it.cum - coalesce(re.q, 0)), 0)), 0)::int
+FROM inbound_shipments s LEFT JOIN it USING (shipment_id) LEFT JOIN re USING (fnsku)
+WHERE s.read_version >= 2 GROUP BY 1"""
+
+
+def monitor_live() -> bool:
+    return os.environ.get("SHIPMENT_MONITOR_LIVE") == "1"
+
+
+def section_keys(token: str) -> dict:
+    """{'1'..'7': gid} from the numbered sections of the shipment board."""
+    out = {}
+    for sec in _asana("GET", f"/projects/{SHIPMENT_BOARD}/sections", token):
+        m = re.match(r"\s*(\d)\.", sec["name"])
+        if m:
+            out[m.group(1)] = sec["gid"]
+    return out
+
+
+def case_emails(case_id: str, since: datetime | None) -> dict:
+    """What the cases mailbox holds about this case: {'found': n, 'denied_at': when|None, 'subject': ...}."""
+    out = {"found": 0, "denied_at": None}
+    try:
+        import google_mail
+        import case_monitor
+        if not case_id or not google_mail.is_connected(CASES_MAILBOX):
+            return out
+        ids = google_mail.search(CASES_MAILBOX, f'"{case_id}" newer_than:120d', 10)
+        out["found"] = len(ids)
+        for mid in ids:
+            m = google_mail._gmail(CASES_MAILBOX, f"/messages/{mid}", {"format": "full"})
+            when = datetime.fromtimestamp(int(m.get("internalDate", 0)) / 1000, timezone.utc)
+            if since and when < since - timedelta(hours=12):
+                continue
+            text = (m.get("snippet", "") + " " + case_monitor._body_text(m.get("payload", {}))).lower()
+            if any(p in text for p in _DENIED) and (not out["denied_at"] or when > out["denied_at"]):
+                out["denied_at"] = when
+                out["subject"] = next((h["value"] for h in m.get("payload", {}).get("headers", [])
+                                       if h["name"].lower() == "subject"), "")[:120]
+    except Exception as exc:
+        out["error"] = f"{type(exc).__name__}: {exc}"[:120]
+    return out
+
+
+def decide_case(t: dict, now: datetime) -> dict | None:
+    """Pure. t: sec ('1'..'7' or None), case_id, sas_case_id, unpaid (int or None when unknown),
+    submitted_at, denied_at. Rule from Cassie: watch the original case; closed/denied -> SAS;
+    still open and unpaid after 14 days -> SAS."""
+    sec, case_id, sas_id, unpaid = t.get("sec"), t.get("case_id"), t.get("sas_case_id"), t.get("unpaid")
+    if sec not in ("1", "2", "3", "4"):
+        return None
+    if unpaid == 0 and (case_id or sas_id or sec == "1"):
+        return {"action": "reimbursed", "to": "7", "complete": True,
+                "why": "The short units on this shipment are now received or reimbursed by Amazon. Nothing more to do."}
+    if sas_id:
+        if sec != "4":
+            return {"action": "sas_submitted", "to": "4",
+                    "why": f"SAS case {sas_id} entered. The agent is watching for the reimbursement."}
+        return None
+    if not case_id:
+        return None
+    if sec == "1":
+        return {"action": "submitted", "to": "2", "stamp": True, "due": WAIT_DAYS,
+                "why": f"Case {case_id} entered. The agent is watching it; nobody needs to check on it."}
+    if sec == "2":
+        since = t.get("submitted_at")
+        if t.get("denied_at") and (not since or t["denied_at"] >= since - timedelta(hours=12)):
+            return {"action": "denied_open_sas", "to": "3", "due": 1, "assign": True,
+                    "why": f"Amazon closed or denied case {case_id}. Open an SAS case and enter the SAS Case ID."}
+        if since and now - since >= timedelta(days=WAIT_DAYS):
+            return {"action": "waited_open_sas", "to": "3", "due": 1, "assign": True,
+                    "why": f"Case {case_id} has been open {WAIT_DAYS} days with no reimbursement. Open an SAS case and "
+                           "enter the SAS Case ID."}
+    return None
+
+
+def watch_cases(conn, token: str, apply: bool, now: datetime | None = None) -> dict:
+    now = now or datetime.now(timezone.utc)
+    secs = section_keys(token)
+    key_of = {gid: k for k, gid in secs.items()}
+    with conn.cursor() as cur:
+        cur.execute(UNPAID_SQL)
+        unpaid = dict(cur.fetchall())
+        cur.execute("SELECT task_gid, submitted_at FROM shipment_cases")
+        seen = dict(cur.fetchall())
+    tasks, params = [], {"completed_since": "now", "limit": 100,
+                         "opt_fields": "name,created_at,memberships.section.gid,memberships.project.gid,"
+                                       "custom_fields.name,custom_fields.text_value,custom_fields.display_value"}
+    while True:
+        r = requests.get(f"https://app.asana.com/api/1.0/projects/{SHIPMENT_BOARD}/tasks", params=params, timeout=60,
+                         headers={"Authorization": f"Bearer {token}"})
+        r.raise_for_status()
+        j = r.json()
+        tasks += j["data"]
+        if not (j.get("next_page") or {}).get("offset"):
+            break
+        params["offset"] = j["next_page"]["offset"]
+    actions, counts, watched, mail = [], {}, 0, []
+    for task in tasks:
+        ids = _SHIPMENT_ID.findall((task.get("name") or "").upper())
+        if not ids:
+            continue
+        sid = ids[0]
+        sec = key_of.get(next((m["section"]["gid"] for m in task.get("memberships", [])
+                               if (m.get("project") or {}).get("gid") == SHIPMENT_BOARD and m.get("section")), None))
+        field = lambda start: next((str(f.get("text_value") or f.get("display_value") or "").strip() or None
+                                    for f in task.get("custom_fields", [])
+                                    if (f.get("name") or "").strip().lower().startswith(start)), None)
+        case_id, sas_id = field("case id"), field("sas case")
+        if sec not in ("1", "2", "3", "4"):
+            continue
+        watched += 1
+        submitted = seen.get(task["gid"])
+        if sec == "2" and not submitted:
+            # a task already sitting in "Case submitted": the case is at least as old as the task
+            submitted = datetime.fromisoformat(task["created_at"].replace("Z", "+00:00"))
+        t = {"sec": sec, "case_id": case_id, "sas_case_id": sas_id, "unpaid": unpaid.get(sid), "submitted_at": submitted}
+        if sec == "2" and case_id and not sas_id:
+            em = case_emails(case_id, submitted)
+            t["denied_at"] = em["denied_at"]
+            mail.append({"shipment": sid, "case_id": case_id, "emails_in_cases_inbox": em["found"],
+                         "reads_as_denied": bool(em["denied_at"]), **({"error": em["error"]} if em.get("error") else {})})
+        d = decide_case(t, now)
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO shipment_cases (task_gid, shipment_id, case_id, sas_case_id, submitted_at, section)
+                           VALUES (%s,%s,%s,%s,%s,%s)
+                           ON CONFLICT (task_gid) DO UPDATE SET case_id=EXCLUDED.case_id, sas_case_id=EXCLUDED.sas_case_id,
+                             section=EXCLUDED.section, last_seen=now(),
+                             submitted_at=coalesce(shipment_cases.submitted_at, EXCLUDED.submitted_at)""",
+                        (task["gid"], sid, case_id, sas_id, submitted if sec == "2" else None, sec))
+        if not d:
+            continue
+        counts[d["action"]] = counts.get(d["action"], 0) + 1
+        actions.append({"task": task["name"][:90], "gid": task["gid"], "from": sec, "to": d["to"], "action": d["action"],
+                        "why": d["why"], "unpaid_units": t["unpaid"],
+                        "case_age_days": (now - submitted).days if submitted else None})
+        if not apply:
+            continue
+        try:
+            if not secs.get(d["to"]):
+                raise RuntimeError(f"section {d['to']} not found on the board")
+            _asana("POST", f"/sections/{secs[d['to']]}/addTask", token, json={"data": {"task": task["gid"]}})
+            data = {}
+            if d.get("due"):
+                data["due_on"] = str((now.astimezone(ZoneInfo("America/New_York")) + timedelta(days=d["due"])).date())
+            if d.get("assign") and ASSIGNEE and ASSIGNEE.lower() != "none":
+                data["assignee"] = ASSIGNEE
+            if d.get("complete"):
+                data["completed"] = True
+            if data:
+                _asana("PUT", f"/tasks/{task['gid']}", token, json={"data": data})
+            _asana("POST", f"/tasks/{task['gid']}/stories", token, json={"data": {"text": d["why"]}})
+            with conn.cursor() as cur:
+                cur.execute("UPDATE shipment_cases SET state=%s, note=%s" + (", submitted_at=now()" if d.get("stamp") else "")
+                            + " WHERE task_gid=%s", (d["action"], d["why"], task["gid"]))
+        except Exception as exc:
+            actions[-1]["error"] = f"{type(exc).__name__}: {exc}"[:200]
+    return {"live": apply, "tasks_watched": watched, "counts": counts, "actions": actions, "case_emails": mail}
 
 
 def _get(token: str, path: str, params: dict) -> dict:
@@ -439,6 +615,12 @@ def run(dry_run: bool = True) -> dict:
             summary["tasks"] = make_tasks(conn, os.environ["ASANA_TOKEN"], apply=live())
         else:
             summary["tasks"] = "skipped: the boards could not be checked, so no task was planned or created"
+        if os.environ.get("ASANA_TOKEN"):
+            progress("watching the shipment cases")
+            try:
+                summary["case_watch"] = watch_cases(conn, os.environ["ASANA_TOKEN"], apply=monitor_live())
+            except Exception as exc:
+                summary["case_watch_error"] = f"{type(exc).__name__}: {exc}"[:300]
         with conn.cursor() as cur:
             cur.execute("""SELECT count(*), count(*) FILTER (WHERE short_units > 0), coalesce(sum(short_units), 0)
                            FROM inbound_shipments WHERE status='CLOSED' AND read_version >= 2""")
