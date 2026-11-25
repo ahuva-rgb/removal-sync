@@ -257,7 +257,7 @@ def section_keys(token: str) -> dict:
     return out
 
 
-def case_emails(case_id: str, since: datetime | None) -> dict:
+def case_emails(case_id: str, since: datetime | None, shipment_id: str = "") -> dict:
     """What the cases mailbox holds about this case: {'found': n, 'denied_at': when|None, 'subject': ...}."""
     out = {"found": 0, "denied_at": None}
     try:
@@ -265,7 +265,9 @@ def case_emails(case_id: str, since: datetime | None) -> dict:
         import case_monitor
         if not case_id or not google_mail.is_connected(CASES_MAILBOX):
             return out
-        ids = google_mail.search(CASES_MAILBOX, f'"{case_id}" newer_than:120d', 10)
+        # Amazon's shipment emails often name only the shipment, not the case number: look for either
+        what = f'"{case_id}" OR "{shipment_id}"' if shipment_id else f'"{case_id}"'
+        ids = google_mail.search(CASES_MAILBOX, f'{{{what}}} newer_than:120d', 15)
         out["found"] = len(ids)
         for mid in ids:
             m = google_mail._gmail(CASES_MAILBOX, f"/messages/{mid}", {"format": "full"})
@@ -273,6 +275,7 @@ def case_emails(case_id: str, since: datetime | None) -> dict:
             if since and when < since - timedelta(hours=12):
                 continue
             text = (m.get("snippet", "") + " " + case_monitor._body_text(m.get("payload", {}))).lower()
+            out["latest"] = max(out.get("latest") or when, when)
             if any(p in text for p in _DENIED) and (not out["denied_at"] or when > out["denied_at"]):
                 out["denied_at"] = when
                 out["subject"] = next((h["value"] for h in m.get("payload", {}).get("headers", [])
@@ -356,10 +359,11 @@ def watch_cases(conn, token: str, apply: bool, now: datetime | None = None) -> d
             submitted = datetime.fromisoformat(task["created_at"].replace("Z", "+00:00"))
         t = {"sec": sec, "case_id": case_id, "sas_case_id": sas_id, "unpaid": unpaid.get(sid), "submitted_at": submitted}
         if sec == "2" and case_id and not sas_id:
-            em = case_emails(case_id, submitted)
+            em = case_emails(case_id, submitted, sid)
             t["denied_at"] = em["denied_at"]
             mail.append({"shipment": sid, "case_id": case_id, "emails_in_cases_inbox": em["found"],
-                         "reads_as_denied": bool(em["denied_at"]), **({"error": em["error"]} if em.get("error") else {})})
+                         "reads_as_denied": bool(em["denied_at"]),
+                         "latest_email": str(em.get("latest") or "")[:16], **({"error": em["error"]} if em.get("error") else {})})
         d = decide_case(t, now)
         with conn.cursor() as cur:
             cur.execute("""INSERT INTO shipment_cases (task_gid, shipment_id, case_id, sas_case_id, submitted_at, section)
