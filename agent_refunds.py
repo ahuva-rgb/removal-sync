@@ -84,6 +84,100 @@ def flatten(t: dict) -> dict:
             "skus": ", ".join(dict.fromkeys(skus)) or None, "units": units or None}
 
 
+# ------------------------------------------------------------- watch list ---
+WAIT_DAYS = int(os.environ.get("REFUND_WAIT_DAYS", "60"))        # a refund becomes a candidate this long after it was issued
+FULL_SHARE = 0.98                                                # refunded product amount / price paid, to count as a full refund
+MAX_ORDER_LOOKUPS = int(os.environ.get("REFUND_MAX_ORDER_LOOKUPS", "150"))
+
+
+def product_amount(t: dict, sku: str | None = None) -> float:
+    """Pure: the product (principal) amount in one transaction, for one SKU or for all items. Refunds are negative."""
+    total = 0.0
+    for item in t.get("items") or []:
+        skus = [c.get("sku") for c in item.get("contexts") or [] if c.get("sku")]
+        if sku and sku not in skus:
+            continue
+        for b in item.get("breakdowns") or []:
+            if b.get("breakdownType") == "ProductCharges":
+                total += float((b.get("breakdownAmount") or {}).get("currencyAmount") or 0)
+    return round(total, 2)
+
+
+def classify_refund(refunded: float, paid: float | None) -> str:
+    """Pure. Rule from Cassie: anything that is not a full refund was issued by us and cannot be filed."""
+    if refunded >= -0.005:
+        return "not_a_product_refund"            # shipping or tax only
+    if paid is None or paid <= 0:
+        return "price_unknown"
+    return "full_refund" if -refunded >= paid * FULL_SHARE else "partial_refund"
+
+
+def build_watch_list(conn, token: str, progress) -> dict:
+    """Full product refunds older than WAIT_DAYS with no return and no reimbursement. Creates nothing."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS refund_watch (
+                order_id text NOT NULL, sku text NOT NULL, refund_date date, refunded numeric(14,2), paid numeric(14,2),
+                units int, kind text, returned boolean, reimbursed boolean, verdict text, checked_at timestamptz DEFAULT now(),
+                asana_task_gid text, PRIMARY KEY (order_id, sku))""")
+        cur.execute("SELECT 1 FROM pg_roles WHERE rolname = 'ledger_reader'")
+        if cur.fetchone():
+            cur.execute("GRANT SELECT ON refund_watch TO ledger_reader")
+        cur.execute("""
+            SELECT e.order_id, e.skus, min(e.posted_at)::date, coalesce(max(e.units), 1), jsonb_agg(e.raw)
+            FROM refund_events e
+            WHERE e.transaction_type = 'Refund' AND e.order_id IS NOT NULL AND e.skus IS NOT NULL
+              AND e.posted_at < now() - make_interval(days => %s)
+              AND NOT EXISTS (SELECT 1 FROM fba_customer_returns c WHERE c.order_id = e.order_id)
+              AND NOT EXISTS (SELECT 1 FROM fba_reimbursements f WHERE f.amazon_order_id = e.order_id)
+              AND NOT EXISTS (SELECT 1 FROM refund_watch w WHERE w.order_id = e.order_id AND w.sku = e.skus
+                                AND w.kind IN ('partial_refund', 'not_a_product_refund'))
+            GROUP BY 1, 2""", (WAIT_DAYS,))
+        rows = cur.fetchall()
+    counts, lookups, listed = {}, 0, []
+    for order_id, sku, day, units, raws in rows:
+        refunded = round(sum(product_amount(r, sku.split(", ")[0]) for r in raws), 2)
+        paid = None
+        if refunded < -0.005:
+            if lookups >= MAX_ORDER_LOOKUPS:
+                counts["left_for_next_run"] = counts.get("left_for_next_run", 0) + 1
+                continue
+            lookups += 1
+            if lookups % 10 == 1:
+                progress(f"checking refunds against the price paid: {lookups} orders looked up")
+            try:
+                import main
+                p = _get(token, {"relatedIdentifierName": "ORDER_ID", "relatedIdentifierValue": order_id,
+                                 "marketplaceId": main.MARKETPLACE_ID,
+                                 "postedAfter": (datetime.now(timezone.utc) - timedelta(days=540)).strftime("%Y-%m-%dT%H:%M:%SZ")})
+                paid = round(sum(product_amount(t, sku.split(", ")[0]) for t in p.get("transactions") or []
+                                 if not is_refund(t) and product_amount(t, sku.split(", ")[0]) > 0), 2) or None
+                time.sleep(2.1)
+            except Exception as exc:
+                counts["lookup_errors"] = counts.get("lookup_errors", 0) + 1
+                counts.setdefault("first_lookup_error", str(exc)[:160])
+        kind = classify_refund(refunded, paid)
+        verdict = "candidate" if kind == "full_refund" else ("check_by_hand" if kind == "price_unknown" else "not_fileable")
+        counts[kind] = counts.get(kind, 0) + 1
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO refund_watch (order_id, sku, refund_date, refunded, paid, units, kind, returned, reimbursed, verdict)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,false,false,%s)
+                           ON CONFLICT (order_id, sku) DO UPDATE SET refunded=EXCLUDED.refunded, paid=coalesce(EXCLUDED.paid, refund_watch.paid),
+                             kind=EXCLUDED.kind, verdict=EXCLUDED.verdict, checked_at=now()""",
+                        (order_id, sku, day, refunded, paid, units, kind, verdict))
+        if verdict == "candidate":
+            listed.append({"order": order_id, "sku": sku, "refunded_on": str(day), "refunded": refunded, "paid": paid})
+    with conn.cursor() as cur:   # anything on the list that has since come back or been paid is settled
+        cur.execute("""UPDATE refund_watch w SET verdict='settled', checked_at=now(),
+                         returned = EXISTS (SELECT 1 FROM fba_customer_returns c WHERE c.order_id = w.order_id),
+                         reimbursed = EXISTS (SELECT 1 FROM fba_reimbursements f WHERE f.amazon_order_id = w.order_id)
+                       WHERE w.verdict IN ('candidate', 'check_by_hand')
+                         AND (EXISTS (SELECT 1 FROM fba_customer_returns c WHERE c.order_id = w.order_id)
+                              OR EXISTS (SELECT 1 FROM fba_reimbursements f WHERE f.amazon_order_id = w.order_id))""")
+    return {"refunds_checked": len(rows), "counts": counts, "candidates": len(listed),
+            "candidate_amount": round(-sum(x["refunded"] for x in listed), 2), "sample": listed[:15]}
+
+
 def run() -> dict:
     import main
     conn = ledger._db()
@@ -161,6 +255,13 @@ def run() -> dict:
             time.sleep(2.1)
         summary["reached"] = str(start)[:16]
         summary["complete"] = start >= now
+        if summary["complete"]:
+            try:
+                summary["watch_list"] = build_watch_list(conn, token, progress)
+            except Exception as exc:
+                summary["watch_list_error"] = f"{type(exc).__name__}: {exc}"[:300]
+        else:
+            summary["watch_list"] = "waiting: the refunds are still being read"
         summary["types_seen"] = dict(sorted(types.items(), key=lambda kv: -kv[1])[:25])
         summary["sample_refunds"] = samples
         with conn.cursor() as cur:
