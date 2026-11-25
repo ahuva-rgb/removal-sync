@@ -48,4 +48,11 @@ if os.environ.get("SHIPMENT_AGENT", "1") != "0":
     except requests.RequestException as exc:
         print("shipments agent: request failed:", exc)
 
+if os.environ.get("REFUND_AGENT", "1") != "0":
+    try:   # reads refunds only; creates nothing. Its result never fails the cron run.
+        r = requests.post(f"{url}/agents/refunds/run", headers=headers, timeout=120)
+        print("refunds agent:", r.status_code, r.text)
+    except requests.RequestException as exc:
+        print("refunds agent: request failed:", exc)
+
 sys.exit(0 if ok else 1)
