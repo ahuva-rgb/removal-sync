@@ -178,6 +178,101 @@ def build_watch_list(conn, token: str, progress) -> dict:
             "candidate_amount": round(-sum(x["refunded"] for x in listed), 2), "sample": listed[:15]}
 
 
+# ------------------------------------------------------------ weekly task ---
+FILE_BOARD = os.environ.get("REFUND_TASK_PROJECT", "1220620863326159")          # Reimbursements to File
+FILE_SECTION_NAME = "To file: Refunds with no return (weekly)"
+CALVIN = os.environ.get("REFUND_TASK_ASSIGNEE", "1208840834774221")
+TASK_AFTER_DAYS = int(os.environ.get("REFUND_TASK_AFTER_DAYS", "75"))           # Amazon pays by itself until about here
+CLAIM_WINDOW_DAYS = 120
+SKIP_SKU = [x.strip().upper() for x in os.environ.get("REFUND_SKIP_SKU", "ROP").split(",") if x.strip()]
+
+
+def tasks_live() -> bool:
+    return os.environ.get("REFUND_TASK_LIVE") == "1"
+
+
+def weekly_task_fields(rows: list[dict], today) -> dict:
+    """Pure: one task for Calvin listing this week's refunds. rows: order, sku, refund_date, refunded, units."""
+    lines = [f"{r['order']} | {r['sku']} | {r['refund_date']:%b %-d, %Y} | ${-float(r['refunded']):,.2f}" for r in rows]
+    late = [r["order"] for r in rows if (today - r["refund_date"]).days > CLAIM_WINDOW_DAYS]
+    total = -sum(float(r["refunded"]) for r in rows)
+    wording = ["Hello,", "",
+               "We are writing about the customer refunds on the FBA orders listed below. Each order was refunded in "
+               f"full more than {TASK_AFTER_DAYS} days ago. The unit has not been returned to our inventory and we have "
+               "not received a reimbursement.", "",
+               "1. Please confirm for each order whether the refund was initiated by the seller.",
+               "2. For every order where the refund was NOT seller-initiated, please reimburse us for the unit under the "
+               "FBA customer returns policy.", "",
+               "Order ID | SKU | Refund date | Amount refunded", *lines, "", "Thank you."]
+    notes = ["STEPS",
+             "1. Open ONE Amazon case for all the orders below (FBA > customer returns / refund with no return).",
+             "2. Paste the case wording below.",
+             "3. Put the Amazon case number in the Case ID field.",
+             "4. When Amazon answers, write in a comment which orders were seller-initiated (nothing to claim) and "
+             "which Amazon agreed to reimburse.", "",
+             f"Orders: {len(rows)}    Total refunded: ${total:,.2f}",
+             "These are full refunds only. Partial and shipping-only refunds were issued by us and are not listed.",
+             *([f"Note: {len(late)} of these were refunded more than {CLAIM_WINDOW_DAYS} days ago, so Amazon may say the "
+                "claim window has passed: " + ", ".join(late)] if late else []), "",
+             "CASE WORDING (copy and paste)", *wording]
+    return {"name": f"Refunds with no return | week of {today:%b %-d, %Y} | {len(rows)} order(s) | ${total:,.2f}",
+            "notes": "\n".join(notes), "due_on": str(today + timedelta(days=1))}
+
+
+def _asana(method: str, path: str, token: str, **kw):
+    r = requests.request(method, f"https://app.asana.com/api/1.0{path}", headers={"Authorization": f"Bearer {token}"},
+                         timeout=90, **kw)
+    if not r.ok:
+        raise RuntimeError(f"Asana {r.status_code}: {r.text[:300]}")
+    return r.json()["data"]
+
+
+def weekly_task(conn, asana_token: str, apply: bool, now: datetime | None = None) -> dict:
+    """Once a week (Monday), one task for Calvin with the refunds Amazon has not returned or paid."""
+    from zoneinfo import ZoneInfo
+    today = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo("America/New_York")).date()
+    with conn.cursor() as cur:
+        cur.execute("""SELECT order_id, sku, refund_date, refunded, units FROM refund_watch
+                       WHERE verdict = 'candidate' AND asana_task_gid IS NULL AND refund_date <= %s
+                       ORDER BY refund_date""", (today - timedelta(days=TASK_AFTER_DAYS),))
+        rows = [dict(zip(["order", "sku", "refund_date", "refunded", "units"], r)) for r in cur.fetchall()]
+    rows = [r for r in rows if not any(k in r["sku"].upper() for k in SKIP_SKU)]
+    out = {"live": apply, "orders_waiting": len(rows), "is_monday": today.weekday() == 0}
+    if not rows:
+        return out
+    # never list an order that already appears on the board
+    seen_text, params = "", {"limit": 100, "opt_fields": "name,notes"}
+    while True:
+        r = requests.get(f"https://app.asana.com/api/1.0/projects/{FILE_BOARD}/tasks", params=params, timeout=60,
+                         headers={"Authorization": f"Bearer {asana_token}"})
+        r.raise_for_status()
+        j = r.json()
+        seen_text += " ".join(f"{t.get('name', '')} {t.get('notes', '')}" for t in j["data"])
+        if not (j.get("next_page") or {}).get("offset"):
+            break
+        params["offset"] = j["next_page"]["offset"]
+    already = [r for r in rows if r["order"] in seen_text]
+    rows = [r for r in rows if r["order"] not in seen_text]
+    f = weekly_task_fields(rows, today) if rows else None
+    out.update(already_on_board=len(already), orders_for_task=len(rows), task=f["name"] if f else None,
+               orders=[f"{r['order']} | {r['sku']} | {r['refund_date']} | {-float(r['refunded']):.2f}" for r in rows][:60])
+    if not (apply and rows and today.weekday() == 0):
+        return out
+    secs = _asana("GET", f"/projects/{FILE_BOARD}/sections", asana_token)
+    sec = next((x["gid"] for x in secs if x["name"].strip().lower().startswith("to file: refunds with no return")), None)
+    if not sec:
+        sec = _asana("POST", f"/projects/{FILE_BOARD}/sections", asana_token, json={"data": {"name": FILE_SECTION_NAME}})["gid"]
+    data = {**f, "projects": [FILE_BOARD], "memberships": [{"project": FILE_BOARD, "section": sec}]}
+    if CALVIN and CALVIN.lower() != "none":
+        data["assignee"] = CALVIN
+    gid = _asana("POST", "/tasks", asana_token, json={"data": data})["gid"]
+    with conn.cursor() as cur:
+        cur.executemany("UPDATE refund_watch SET asana_task_gid=%s WHERE order_id=%s AND sku=%s",
+                        [(gid, r["order"], r["sku"]) for r in rows])
+    out["task_created"] = gid
+    return out
+
+
 def run() -> dict:
     import main
     conn = ledger._db()
@@ -262,6 +357,11 @@ def run() -> dict:
                 summary["watch_list_error"] = f"{type(exc).__name__}: {exc}"[:300]
         else:
             summary["watch_list"] = "waiting: the refunds are still being read"
+        if summary["complete"] and os.environ.get("ASANA_TOKEN"):
+            try:
+                summary["weekly_task"] = weekly_task(conn, os.environ["ASANA_TOKEN"], apply=tasks_live())
+            except Exception as exc:
+                summary["weekly_task_error"] = f"{type(exc).__name__}: {exc}"[:300]
         summary["types_seen"] = dict(sorted(types.items(), key=lambda kv: -kv[1])[:25])
         summary["sample_refunds"] = samples
         with conn.cursor() as cur:
