@@ -234,12 +234,22 @@ def remaining_by_item(conn, fresh: bool = False) -> dict:
     return out
 
 
+def net_claims(conn) -> dict:
+    """{shipment_id: units to claim}.  Cassie's rule: extra units received on the same shipment cancel out short
+    ones, whatever the item.  A shipment that received as many units as were shipped (or more) has nothing to claim."""
+    per: dict = {}
+    for (sid, _sku), (r, _o, _p) in remaining_by_item(conn).items():
+        per[sid] = per.get(sid, 0) + r
+    with conn.cursor() as cur:
+        cur.execute("""SELECT shipment_id, sum(greatest(received - shipped, 0)) FROM inbound_items_all
+                       GROUP BY 1 HAVING sum(greatest(received - shipped, 0)) > 0""")
+        extra = dict(cur.fetchall())
+    return {sid: max(n - int(extra.get(sid, 0)), 0) for sid, n in per.items()}
+
+
 def candidates(conn) -> list[dict]:
     """Closed shipments (last 120 days) that still have units to claim and no task anywhere."""
-    rem = remaining_by_item(conn)
-    per: dict = {}
-    for (sid, _sku), (r, _o, _p) in rem.items():
-        per[sid] = per.get(sid, 0) + r
+    per = net_claims(conn)
     with conn.cursor() as cur:
         cur.execute("""SELECT s.shipment_id, s.name, s.destination_fc, s.shipped, s.received, s.short_units, s.over_units
                        FROM inbound_shipments s
@@ -257,8 +267,7 @@ def unpaid_by_shipment(conn) -> dict:
     with conn.cursor() as cur:
         cur.execute("SELECT shipment_id FROM inbound_closed")
         out = {r[0]: 0 for r in cur.fetchall()}
-    for (sid, _sku), (r, _o, _p) in remaining_by_item(conn).items():
-        out[sid] = out.get(sid, 0) + r
+    out.update(net_claims(conn))
     return out
 
 
@@ -293,7 +302,8 @@ def task_fields(c: dict, items: list[dict], remaining: dict | None = None) -> di
              f"Shipment: {c['shipment_id']}  ({c['name']})",
              f"Amazon warehouse: {c['destination_fc']}",
              f"Units shipped: {c['shipped']}   Units received: {c['received']}   Units short: {c['short']}",
-             f"Units to claim: {c['claim_units']}",
+             f"Units to claim: {c['claim_units']}"
+             + (f"  (after taking off {c['over_units']} extra unit(s) Amazon received on this shipment)" if c.get("over_units") else ""),
              "",
              "ITEMS TO CLAIM (claim only these units)", *lines,
              "",
@@ -359,6 +369,7 @@ def refresh_tasks(conn, token: str, apply: bool) -> dict:
     """Bring the agent's own open tasks in line with today's numbers: correct the units to claim, and close a task
     that has nothing left to claim. Only touches tasks still waiting in "1. To file" with no Case ID."""
     remaining = remaining_by_item(conn)
+    net = net_claims(conn)
     secs = section_keys(token)
     with conn.cursor() as cur:
         cur.execute("""SELECT c.shipment_id, c.asana_task_gid, c.claim_units, s.name, s.destination_fc, s.shipped, s.received,
@@ -382,7 +393,7 @@ def refresh_tasks(conn, token: str, apply: bool) -> dict:
             continue
         items = shipment_items(conn, sid)
         short = sum(max(i["shipped"] - i["received"], 0) for i in items)
-        claim = sum(remaining.get((sid, i["sku"]), (0, 0, 0))[0] for i in items if i["shipped"] > i["received"])
+        claim = net.get(sid, 0)
         if claim == old_claim:
             out["unchanged"] += 1
             continue
@@ -393,9 +404,9 @@ def refresh_tasks(conn, token: str, apply: bool) -> dict:
                 out["closed"].append(f"{sid} ({name}): was {old_claim} unit(s)")
                 if apply:
                     _asana("POST", f"/tasks/{gid}/stories", token, json={"data": {"text":
-                           "Closing this task: nothing to claim. The units short on this shipment were received by Amazon "
-                           "as extra units on our other shipments of the same items, or have already been reimbursed. "
-                           "A case would be answered the same way."}})
+                           "Closing this task: nothing to claim. Amazon received as many units on this shipment as were "
+                           "shipped (extras of other items cancel the short ones), or the short units were received on "
+                           "another shipment, or they have already been reimbursed."}})
                     _asana("PUT", f"/tasks/{gid}", token, json={"data": {"completed": True}})
                     with conn.cursor() as cur:
                         cur.execute("UPDATE shipment_claims SET claim_units=0, closed_at=now(), last_seen=now() "
@@ -822,7 +833,7 @@ def run(dry_run: bool = True) -> dict:
             progress("checking the agent's open tasks against today's numbers")
             try:
                 summary["task_refresh"] = refresh_tasks(conn, os.environ["ASANA_TOKEN"],
-                                                        apply=live() and os.environ.get("SHIPMENT_REFRESH_LIVE", "0") == "1")
+                                                        apply=live() and os.environ.get("SHIPMENT_REFRESH_LIVE", "1") == "1")
             except Exception as exc:
                 summary["task_refresh_error"] = f"{type(exc).__name__}: {exc}"[:300]
             progress("working out which short shipments need a task")
