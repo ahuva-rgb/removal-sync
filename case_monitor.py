@@ -244,7 +244,7 @@ def ensure_export_task(token: str, secs: dict, now: datetime | None = None) -> s
 
 
 # ---------------------------------------------------------------- emails ---
-_FNSKU = re.compile(r"FNSKU\s+([A-Z0-9]{10})")
+_FNSKU = re.compile(r"FN(?:SKU|KSU)\s+([A-Z0-9]{10})")   # Amazon writes "FNKSU" in its approval emails
 
 
 def read_case_emails(conn) -> dict:
@@ -257,7 +257,8 @@ def read_case_emails(conn) -> dict:
     except Exception as exc:
         return {"mailbox_error": f"{type(exc).__name__}: {exc}"}
     with conn.cursor() as cur:
-        cur.execute("SELECT message_id FROM case_emails")
+        # emails the agent could not read before (no FNSKU found, not a decline) are read again
+        cur.execute("SELECT message_id FROM case_emails WHERE NOT (kind = 'other' AND fnsku IS NULL)")
         seen = {r[0] for r in cur.fetchall()}
     new = 0
     for mid in ids:
@@ -271,12 +272,15 @@ def read_case_emails(conn) -> dict:
         hit = _FNSKU.search(text)
         low = text.lower()
         kind = "declined" if "unable to make any additional adjustments" in low else \
-               "approved" if ("has been approved" in low or "we have issued" in low or "additional reimbursement" in low) \
+               "approved" if ("processed for reimbursement" in low or "eligible for re-evaluation" in low
+                              or "has been approved" in low or "we have issued" in low
+                              or "additional reimbursement" in low) \
                else "other"
         subject = next((h["value"] for h in m.get("payload", {}).get("headers", []) if h["name"].lower() == "subject"), "")
         with conn.cursor() as cur:
             cur.execute("""INSERT INTO case_emails (message_id, fnsku, kind, received_at, subject)
-                           VALUES (%s,%s,%s,to_timestamp(%s),%s) ON CONFLICT DO NOTHING""",
+                           VALUES (%s,%s,%s,to_timestamp(%s),%s)
+                           ON CONFLICT (message_id) DO UPDATE SET fnsku=EXCLUDED.fnsku, kind=EXCLUDED.kind""",
                         (mid, hit.group(1) if hit else None, kind, int(m.get("internalDate", 0)) / 1000, subject[:200]))
         new += 1
     return {"emails_found": len(ids), "new": new}
@@ -320,7 +324,16 @@ def decide(t: dict, now: datetime) -> dict | None:
                     "why": f"Amazon paid ${extra:,.2f} more, but it is still short ${remaining:,.2f}. This task is closed "
                            "and a new task for the remaining amount will be created."}
     sec, case_id, sas_id = t.get("section"), t.get("case_id"), t.get("sas_case_id")
-    if sec in ("approved", "denied", "review", "export"):
+    if sec in ("approved", "denied", "export"):
+        return None
+    ap_at = t.get("approved_at")
+    if ap_at and (case_id or sas_id) and (not t.get("declined_at") or ap_at > t["declined_at"]) \
+            and (not t.get("task_created_at") or ap_at >= t["task_created_at"]):
+        return {"action": "approved_by_email", "to": "approved", "complete": True,
+                "why": f"Amazon approved the re-evaluation for this FNSKU (email of {ap_at:%b %-d}): \"eligible for "
+                       "re-evaluation and has been processed for reimbursement\". Amazon says to allow 4-5 business "
+                       "days for the payment to post. Nothing more to do."}
+    if sec == "review":
         return None
     cost_ok = t.get("approved_cost") is not None and t.get("claim_cost") is not None and \
         Decimal(t["approved_cost"]) >= Decimal(t["claim_cost"]) - Decimal("0.02")
@@ -418,10 +431,10 @@ def monitor(conn, token: str, fresh: dict, dry_run: bool, now: datetime | None =
 
     with conn.cursor() as cur:
         cur.execute("""SELECT reimbursement_id, sku, fnsku, pct, quantity, cost, correct_total, paid_total, asana_task_gid,
-                              submitted_at, sas_submitted_at
+                              submitted_at, sas_submitted_at, task_created_at
                        FROM payment_claims WHERE asana_task_gid IS NOT NULL AND task_completed_at IS NULL""")
         cols = ["reimbursement_id", "sku", "fnsku", "pct", "quantity", "claim_cost", "correct_total", "paid_at_task",
-                "gid", "submitted_at", "sas_submitted_at"]
+                "gid", "submitted_at", "sas_submitted_at", "task_created_at"]
         claims = {r[8]: dict(zip(cols, r)) for r in cur.fetchall()}
         cur.execute("""SELECT message_id, fnsku, kind, received_at, used_for_task FROM case_emails
                        WHERE fnsku IS NOT NULL ORDER BY received_at""")
@@ -443,10 +456,12 @@ def monitor(conn, token: str, fresh: dict, dry_run: bool, now: datetime | None =
         f = fresh.get((c["reimbursement_id"], c["sku"]))
         mine = [e for e in emails if e["fnsku"] == c["fnsku"] and e["used"] in (None, task["gid"])]
         declined = next((e for e in reversed(mine) if e["kind"] == "declined"), None)
-        other = next((e for e in reversed(mine) if e["kind"] != "declined"), None)
+        approved = next((e for e in reversed(mine) if e["kind"] == "approved"), None)
+        other = next((e for e in reversed(mine) if e["kind"] not in ("declined", "approved")), None)
         t = {**c, "section": by_gid.get(sec_gid), "case_id": case_id, "sas_case_id": sas_id,
              "paid_now": f.get("paid_total") if f else None,
              "declined_at": declined["at"] if declined else None, "other_reply_at": other["at"] if other else None,
+             "approved_at": approved["at"] if approved else None,
              "approved_cost": seller_approved(costs, c["fnsku"])}
         if t["section"] == "submitted" and not c["submitted_at"]:
             t["submitted_at"] = now      # first time the agent sees it in Submitted: the clock starts today
@@ -461,6 +476,11 @@ def monitor(conn, token: str, fresh: dict, dry_run: bool, now: datetime | None =
                         "to": d["to"], "action": d["action"], "why": d["why"]})
         if d["action"] in ("sas_needed", "fix_cost", "denied") and declined:
             declined["used"] = task["gid"]          # one decline email answers one task (same FNSKU, several tasks)
+        if d["action"] == "approved_by_email" and approved:
+            approved["used"] = task["gid"]          # one approval email closes one task
+            if apply:
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE case_emails SET used_for_task=%s WHERE message_id=%s", (task["gid"], approved["id"]))
         if not apply:
             continue
         try:
