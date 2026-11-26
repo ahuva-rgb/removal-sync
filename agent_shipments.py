@@ -416,6 +416,8 @@ def refresh_tasks(conn, token: str, apply: bool) -> dict:
                            "shipped (extras of other items cancel the short ones), or the short units were received on "
                            "another shipment, or they have already been reimbursed."}})
                     _asana("PUT", f"/tasks/{gid}", token, json={"data": {"completed": True}})
+                    if secs.get("7"):      # Cassie, Nov 26: completed tasks live in the completed section
+                        _asana("POST", f"/sections/{secs['7']}/addTask", token, json={"data": {"task": gid}})
                     with conn.cursor() as cur:
                         cur.execute("UPDATE shipment_claims SET claim_units=0, closed_at=now(), last_seen=now() "
                                     "WHERE shipment_id=%s", (sid,))
