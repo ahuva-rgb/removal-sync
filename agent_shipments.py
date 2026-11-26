@@ -128,42 +128,138 @@ def live() -> bool:
     return os.environ.get("SHIPMENT_AGENT_LIVE") == "1"
 
 
-# A unit only counts as missing when the item is short across ALL shipments together:
-#   missing = short units on closed shipments
-#             - extra units of the same item received on any other shipment (checked in against the wrong shipment)
-#             - units Amazon already reimbursed as lost/damaged inbound (reversals taken off)
-# What is left is assigned to the newest short shipments of that item.
-REMAIN_CTE = """
-WITH re AS (SELECT fnsku, greatest(sum(quantity_reimbursed_total), 0) q FROM fba_reimbursements
-            WHERE approval_date >= current_date - 420
-              AND (reason IN ('Lost_Inbound','Damaged_Inbound')
-                   OR (reason = 'Reimbursement_Reversal' AND original_reimbursement_type IN ('Lost_Inbound','Damaged_Inbound')))
-            GROUP BY 1),
-ov AS (SELECT fnsku, sum(received - shipped) o FROM inbound_items_all WHERE received > shipped GROUP BY 1),
-sh AS (SELECT a.shipment_id, a.sku, a.fnsku, (a.shipped - a.received) short,
-              sum(a.shipped - a.received) OVER (PARTITION BY a.fnsku ORDER BY a.shipment_id, a.sku) cum
-       FROM inbound_items_all a JOIN inbound_closed c USING (shipment_id) WHERE a.shipped > a.received),
-rem AS (SELECT sh.shipment_id, sh.sku, sh.fnsku, sh.short, coalesce(ov.o, 0) over_elsewhere, coalesce(re.q, 0) reimbursed,
-               greatest(least(sh.short, sh.cum - coalesce(re.q, 0) - coalesce(ov.o, 0)), 0)::int remaining
-        FROM sh LEFT JOIN re USING (fnsku) LEFT JOIN ov USING (fnsku))
-"""
-CANDIDATES_SQL = REMAIN_CTE + """
-SELECT r.shipment_id, s.name, s.destination_fc, s.shipped, s.received, sum(r.short)::int, s.over_units,
-       sum(r.remaining)::int AS claim_units
-FROM rem r JOIN inbound_shipments s USING (shipment_id)
-WHERE s.read_version >= 2 AND s.status = 'CLOSED'
-  AND r.shipment_id NOT IN (SELECT shipment_id FROM shipment_board_refs)
-  AND r.shipment_id NOT IN (SELECT shipment_id FROM shipment_claims WHERE asana_task_gid IS NOT NULL)
-GROUP BY 1, 2, 3, 4, 5, 7 HAVING sum(r.remaining) > 0
-ORDER BY 8 DESC, 1"""
-REMAIN_ITEMS_SQL = REMAIN_CTE + "SELECT shipment_id, sku, remaining, over_elsewhere, reimbursed FROM rem"
+# ---------------------------------------------------------------- matching ---
+# Which short units are really unpaid?  Amazon's reimbursement report does not name the shipment, but one
+# reimbursement ID covers one shipment's missing items.  So each lost-inbound reimbursement is matched to the
+# closed shipment whose short items it fits best (same items, same quantities, received before it was paid).
+# Reversed reimbursements are taken off first.  Whatever is still short after that is reduced by extra units of
+# the same item that Amazon checked in against our other shipments.  Only what is left is a claim.
+_match_cache: dict = {}
 
 
-def remaining_by_item(conn) -> dict:
-    """{(shipment_id, sku): (units still to claim, extra units of the item on other shipments, units reimbursed)}"""
+def match_reimbursements(shorts: list, reimbs: list, overs: list, first_receipt: dict, po: dict) -> dict:
+    """Pure.  shorts: [(shipment_id, sku, fnsku, short)]   reimbs: [(reimbursement_id, date, {fnsku: qty})]
+    overs: [(shipment_id, fnsku, extra)]   first_receipt: {shipment_id: date}   po: {shipment_id: po name}
+    Returns {(shipment_id, sku): [remaining, reimbursed, covered_by_extra_elsewhere]}."""
+    rem = {(sid, sku): [int(q), 0, 0] for sid, sku, _f, q in shorts}
+    by_fnsku: dict = {}
+    for sid, sku, f, _q in shorts:
+        by_fnsku.setdefault(f, []).append((sid, sku))
+    for _rid, day, items in sorted(reimbs, key=lambda r: (-len(r[2]), r[1])):
+        left = {f: int(q) for f, q in items.items() if q and q > 0}
+        for _ in range(6):
+            score: dict = {}
+            for f, q in left.items():
+                if q <= 0:
+                    continue
+                for sid, sku in by_fnsku.get(f, []):
+                    r = rem[(sid, sku)][0]
+                    fr = first_receipt.get(sid)
+                    if r > 0 and (fr is None or fr <= day):
+                        score[sid] = score.get(sid, 0) + min(q, r)
+            if not score:
+                break
+            best = max(score.values())
+            # most items matched wins; on a tie the shipment received most recently before the payment
+            sid = max((x for x, v in score.items() if v == best),
+                      key=lambda x: (first_receipt.get(x) is not None, str(first_receipt.get(x) or ""), x))
+            for f in list(left):
+                for s2, sku in by_fnsku.get(f, []):
+                    if s2 == sid and left[f] > 0 and rem[(s2, sku)][0] > 0:
+                        take = min(left[f], rem[(s2, sku)][0])
+                        rem[(s2, sku)][0] -= take
+                        rem[(s2, sku)][1] += take
+                        left[f] -= take
+            if not any(q > 0 for q in left.values()):
+                break
+    for osid, f, extra in sorted(overs, key=lambda o: o[0]):
+        extra = int(extra)
+        cands = [k for k in by_fnsku.get(f, []) if rem[k][0] > 0 and k[0] != osid]
+        base = po.get(osid)
+        odate = str(first_receipt.get(osid) or "")
+        cands.sort(key=lambda k: (0 if (base and po.get(k[0]) == base) else 1,
+                                  abs(_ordinal(first_receipt.get(k[0])) - _ordinal(first_receipt.get(osid))), k[0]))
+        for k in cands:
+            if extra <= 0:
+                break
+            take = min(extra, rem[k][0])
+            rem[k][0] -= take
+            rem[k][2] += take
+            extra -= take
+    return rem
+
+
+def _ordinal(d) -> int:
+    try:
+        return d.toordinal()
+    except AttributeError:
+        return 0
+
+
+def _po_base(name: str | None) -> str | None:
+    return re.sub(r"\s+[A-Za-z]$", "", name.strip()).upper() if name else None
+
+
+def remaining_by_item(conn, fresh: bool = False) -> dict:
+    """{(shipment_id, sku): (units still to claim, extra units matched from other shipments, units reimbursed)}"""
+    if _match_cache.get("rem") is not None and not fresh:
+        return _match_cache["rem"]
     with conn.cursor() as cur:
-        cur.execute(REMAIN_ITEMS_SQL)
-        return {(a, b): (c, d, e) for a, b, c, d, e in cur.fetchall()}
+        cur.execute("""SELECT a.shipment_id, a.sku, a.fnsku, a.shipped - a.received FROM inbound_items_all a
+                       JOIN inbound_closed c USING (shipment_id) WHERE a.shipped > a.received""")
+        shorts = cur.fetchall()
+        cur.execute("SELECT shipment_id, fnsku, received - shipped FROM inbound_items_all WHERE received > shipped")
+        overs = cur.fetchall()
+        cur.execute("""SELECT reference_id, min(event_date) FROM ledger_detail
+                       WHERE event_type = 'Receipts' AND reference_id LIKE 'FBA%%' GROUP BY 1""")
+        first_receipt = dict(cur.fetchall())
+        cur.execute("""SELECT reimbursement_id, fnsku, min(approval_date), sum(quantity_reimbursed_total)
+                       FROM fba_reimbursements WHERE reason IN ('Lost_Inbound','Damaged_Inbound')
+                         AND approval_date >= current_date - 420 GROUP BY 1, 2""")
+        paid: dict = {}
+        for rid, f, day, q in cur.fetchall():
+            e = paid.setdefault(rid, [day, {}])
+            e[0] = min(e[0], day)
+            e[1][f] = e[1].get(f, 0) + int(q or 0)
+        cur.execute("""SELECT original_reimbursement_id, fnsku, sum(quantity_reimbursed_total) FROM fba_reimbursements
+                       WHERE reason = 'Reimbursement_Reversal' AND approval_date >= current_date - 420 GROUP BY 1, 2""")
+        for rid, f, q in cur.fetchall():        # a reversal takes units back off the reimbursement it reverses
+            if rid in paid and f in paid[rid][1]:
+                paid[rid][1][f] = max(paid[rid][1][f] + int(q or 0), 0)
+        cur.execute("SELECT shipment_id, name FROM inbound_shipments")
+        po = {sid: _po_base(n) for sid, n in cur.fetchall()}
+    rem = match_reimbursements(shorts, [(rid, e[0], e[1]) for rid, e in paid.items()], overs, first_receipt, po)
+    out = {k: (v[0], v[2], v[1]) for k, v in rem.items()}
+    _match_cache["rem"] = out
+    return out
+
+
+def candidates(conn) -> list[dict]:
+    """Closed shipments (last 120 days) that still have units to claim and no task anywhere."""
+    rem = remaining_by_item(conn)
+    per: dict = {}
+    for (sid, _sku), (r, _o, _p) in rem.items():
+        per[sid] = per.get(sid, 0) + r
+    with conn.cursor() as cur:
+        cur.execute("""SELECT s.shipment_id, s.name, s.destination_fc, s.shipped, s.received, s.short_units, s.over_units
+                       FROM inbound_shipments s
+                       WHERE s.read_version >= 2 AND s.status = 'CLOSED'
+                         AND s.shipment_id NOT IN (SELECT shipment_id FROM shipment_board_refs)
+                         AND s.shipment_id NOT IN (SELECT shipment_id FROM shipment_claims WHERE asana_task_gid IS NOT NULL)""")
+        cols = ["shipment_id", "name", "destination_fc", "shipped", "received", "short", "over_units"]
+        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    out = [{**r, "claim_units": per.get(r["shipment_id"], 0)} for r in rows if per.get(r["shipment_id"], 0) > 0]
+    return sorted(out, key=lambda c: (-c["claim_units"], c["shipment_id"]))
+
+
+def unpaid_by_shipment(conn) -> dict:
+    """{shipment_id: units still to claim} for every closed shipment the agent knows."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT shipment_id FROM inbound_closed")
+        out = {r[0]: 0 for r in cur.fetchall()}
+    for (sid, _sku), (r, _o, _p) in remaining_by_item(conn).items():
+        out[sid] = out.get(sid, 0) + r
+    return out
 
 
 def shipment_items(conn, shipment_id: str) -> list[dict]:
@@ -222,10 +318,7 @@ def _asana(method: str, path: str, token: str, **kw) -> dict:
 def make_tasks(conn, token: str, apply: bool) -> dict:
     """Plan (and, when live, create) a task with its packing slip for every short shipment that has none."""
     import packing_slip
-    with conn.cursor() as cur:
-        cur.execute(CANDIDATES_SQL)
-        cols = ["shipment_id", "name", "destination_fc", "shipped", "received", "short", "over_units", "claim_units"]
-        cands = [dict(zip(cols, r)) for r in cur.fetchall()]
+    cands = candidates(conn)
     remaining = remaining_by_item(conn)
     planned, created, errors = [], 0, []
     for c in cands:
@@ -330,11 +423,6 @@ CASES_MAILBOX = os.environ.get("CASES_MAILBOX", "cases@gefenoptical.com")
 _DENIED = ("unable to", "not eligible", "cannot reimburse", "can't reimburse", "will not be reimburs", "no reimbursement",
            "completed our investigation", "investigation is complete", "have been accounted for", "declin", "denied",
            "not able to", "no further action", "claim window", "does not qualify")
-UNPAID_SQL = REMAIN_CTE + """
-SELECT c.shipment_id, coalesce(sum(r.remaining), 0)::int
-FROM inbound_closed c LEFT JOIN rem r USING (shipment_id) GROUP BY 1"""
-
-
 def monitor_live() -> bool:
     return os.environ.get("SHIPMENT_MONITOR_LIVE") == "1"
 
@@ -414,8 +502,7 @@ def watch_cases(conn, token: str, apply: bool, now: datetime | None = None) -> d
     secs = section_keys(token)
     key_of = {gid: k for k, gid in secs.items()}
     with conn.cursor() as cur:
-        cur.execute(UNPAID_SQL)
-        unpaid = dict(cur.fetchall())
+        unpaid = unpaid_by_shipment(conn)
         cur.execute("SELECT task_gid, submitted_at FROM shipment_cases")
         seen = dict(cur.fetchall())
     tasks, params = [], {"completed_since": "now", "limit": 100,
@@ -654,6 +741,7 @@ def run(dry_run: bool = True) -> dict:
                 mismatches.append({"shipment": sid, "error": str(exc)[:120]})
         summary.update(spot_checked=checked, spot_mismatches=mismatches)
         trust_bulk = checked > 0 and not mismatches
+        _match_cache.clear()
 
         # Keep every item line (all shipments, 420 days) and the list of closed shipments: the netting needs both.
         if trust_bulk:
@@ -738,7 +826,16 @@ def run(dry_run: bool = True) -> dict:
             except Exception as exc:
                 summary["task_refresh_error"] = f"{type(exc).__name__}: {exc}"[:300]
             progress("working out which short shipments need a task")
-            summary["tasks"] = make_tasks(conn, os.environ["ASANA_TOKEN"], apply=live())
+            # creating tasks stays off until the matching has been checked against what Azel found by hand
+            summary["tasks"] = make_tasks(conn, os.environ["ASANA_TOKEN"],
+                                          apply=live() and os.environ.get("SHIPMENT_MATCH_VERIFIED") == "1")
+            try:
+                per = unpaid_by_shipment(conn)
+                with conn.cursor() as cur:
+                    cur.execute("SELECT shipment_id, claim_units FROM shipment_claims WHERE asana_task_gid IS NOT NULL")
+                    summary["existing_tasks_recheck"] = {sid: [old, per.get(sid)] for sid, old in cur.fetchall()}
+            except Exception as exc:
+                summary["recheck_error"] = str(exc)[:200]
         else:
             summary["tasks"] = "skipped: the boards or the shipment items could not be read, so no task was planned or created"
         if os.environ.get("ASANA_TOKEN"):
