@@ -55,13 +55,19 @@ def ensure_tables(conn):
             CREATE TABLE IF NOT EXISTS shipment_cases (
                 task_gid text PRIMARY KEY, shipment_id text, case_id text, sas_case_id text, submitted_at timestamptz,
                 section text, state text, note text, last_seen timestamptz NOT NULL DEFAULT now());
+            CREATE TABLE IF NOT EXISTS inbound_items_all (
+                shipment_id text NOT NULL, sku text NOT NULL, fnsku text, shipped int, received int,
+                PRIMARY KEY (shipment_id, sku));
+            CREATE INDEX IF NOT EXISTS inbound_items_all_fnsku ON inbound_items_all (fnsku);
+            CREATE TABLE IF NOT EXISTS inbound_closed (shipment_id text PRIMARY KEY, seen_at timestamptz DEFAULT now());
+            ALTER TABLE shipment_claims ADD COLUMN IF NOT EXISTS closed_at timestamptz;
             CREATE TABLE IF NOT EXISTS shipment_agent_runs (
                 id bigserial PRIMARY KEY, started_at timestamptz NOT NULL DEFAULT now(), finished_at timestamptz,
                 status text NOT NULL, dry_run boolean, summary jsonb, error text);
         """)
         cur.execute("SELECT 1 FROM pg_roles WHERE rolname = 'ledger_reader'")
         if cur.fetchone():
-            cur.execute("GRANT SELECT ON inbound_shipments, inbound_shipment_items, shipment_agent_runs, shipment_board_refs, shipment_claims, shipment_cases TO ledger_reader")
+            cur.execute("GRANT SELECT ON inbound_shipments, inbound_shipment_items, shipment_agent_runs, shipment_board_refs, shipment_claims, shipment_cases, inbound_items_all, inbound_closed TO ledger_reader")
 
 
 BOARDS = {   # where a shipment may already have a task
@@ -122,22 +128,42 @@ def live() -> bool:
     return os.environ.get("SHIPMENT_AGENT_LIVE") == "1"
 
 
-CANDIDATES_SQL = """
-WITH re AS (SELECT fnsku, sum(quantity_reimbursed_total) q FROM fba_reimbursements
-            WHERE reason IN ('Lost_Inbound','Damaged_Inbound') AND approval_date >= current_date - 150 GROUP BY 1),
-it AS (SELECT i.shipment_id, i.fnsku, (i.shipped - i.received) short,
-              sum(i.shipped - i.received) OVER (PARTITION BY i.fnsku ORDER BY i.shipment_id) cum
-       FROM inbound_shipment_items i JOIN inbound_shipments s USING (shipment_id)
-       WHERE s.read_version >= 2 AND s.status = 'CLOSED' AND i.shipped > i.received),
-un AS (SELECT it.shipment_id, sum(greatest(least(it.short, it.cum - coalesce(re.q, 0)), 0)) uncovered, sum(it.short) short
-       FROM it LEFT JOIN re USING (fnsku) GROUP BY 1)
-SELECT u.shipment_id, s.name, s.destination_fc, s.shipped, s.received, u.short, s.over_units,
-       greatest(u.uncovered - s.over_units, 0)::int AS claim_units
-FROM un u JOIN inbound_shipments s USING (shipment_id)
-WHERE greatest(u.uncovered - s.over_units, 0) > 0
-  AND u.shipment_id NOT IN (SELECT shipment_id FROM shipment_board_refs)
-  AND u.shipment_id NOT IN (SELECT shipment_id FROM shipment_claims WHERE asana_task_gid IS NOT NULL)
+# A unit only counts as missing when the item is short across ALL shipments together:
+#   missing = short units on closed shipments
+#             - extra units of the same item received on any other shipment (checked in against the wrong shipment)
+#             - units Amazon already reimbursed as lost/damaged inbound (reversals taken off)
+# What is left is assigned to the newest short shipments of that item.
+REMAIN_CTE = """
+WITH re AS (SELECT fnsku, greatest(sum(quantity_reimbursed_total), 0) q FROM fba_reimbursements
+            WHERE approval_date >= current_date - 420
+              AND (reason IN ('Lost_Inbound','Damaged_Inbound')
+                   OR (reason = 'Reimbursement_Reversal' AND original_reimbursement_type IN ('Lost_Inbound','Damaged_Inbound')))
+            GROUP BY 1),
+ov AS (SELECT fnsku, sum(received - shipped) o FROM inbound_items_all WHERE received > shipped GROUP BY 1),
+sh AS (SELECT a.shipment_id, a.sku, a.fnsku, (a.shipped - a.received) short,
+              sum(a.shipped - a.received) OVER (PARTITION BY a.fnsku ORDER BY a.shipment_id, a.sku) cum
+       FROM inbound_items_all a JOIN inbound_closed c USING (shipment_id) WHERE a.shipped > a.received),
+rem AS (SELECT sh.shipment_id, sh.sku, sh.fnsku, sh.short, coalesce(ov.o, 0) over_elsewhere, coalesce(re.q, 0) reimbursed,
+               greatest(least(sh.short, sh.cum - coalesce(re.q, 0) - coalesce(ov.o, 0)), 0)::int remaining
+        FROM sh LEFT JOIN re USING (fnsku) LEFT JOIN ov USING (fnsku))
+"""
+CANDIDATES_SQL = REMAIN_CTE + """
+SELECT r.shipment_id, s.name, s.destination_fc, s.shipped, s.received, sum(r.short)::int, s.over_units,
+       sum(r.remaining)::int AS claim_units
+FROM rem r JOIN inbound_shipments s USING (shipment_id)
+WHERE s.read_version >= 2 AND s.status = 'CLOSED'
+  AND r.shipment_id NOT IN (SELECT shipment_id FROM shipment_board_refs)
+  AND r.shipment_id NOT IN (SELECT shipment_id FROM shipment_claims WHERE asana_task_gid IS NOT NULL)
+GROUP BY 1, 2, 3, 4, 5, 7 HAVING sum(r.remaining) > 0
 ORDER BY 8 DESC, 1"""
+REMAIN_ITEMS_SQL = REMAIN_CTE + "SELECT shipment_id, sku, remaining, over_elsewhere, reimbursed FROM rem"
+
+
+def remaining_by_item(conn) -> dict:
+    """{(shipment_id, sku): (units still to claim, extra units of the item on other shipments, units reimbursed)}"""
+    with conn.cursor() as cur:
+        cur.execute(REMAIN_ITEMS_SQL)
+        return {(a, b): (c, d, e) for a, b, c, d, e in cur.fetchall()}
 
 
 def shipment_items(conn, shipment_id: str) -> list[dict]:
@@ -150,11 +176,19 @@ def shipment_items(conn, shipment_id: str) -> list[dict]:
                 for a, b, c, d, e in cur.fetchall()]
 
 
-def task_fields(c: dict, items: list[dict]) -> dict:
-    """Pure: the Asana task for one short shipment."""
-    short = [i for i in items if i["shipped"] > i["received"]]
-    lines = [f"- {i['sku']} | FNSKU {i['fnsku']} | shipped {i['shipped']}, received {i['received']}, "
-             f"short {i['shipped'] - i['received']}" for i in short]
+def task_fields(c: dict, items: list[dict], remaining: dict | None = None) -> dict:
+    """Pure: the Asana task for one short shipment. remaining: {(shipment_id, sku): (to_claim, over_elsewhere, reimbursed)}"""
+    remaining = remaining or {}
+    lines = []
+    for i in items:
+        if i["shipped"] <= i["received"]:
+            continue
+        short = i["shipped"] - i["received"]
+        claim, elsewhere, paid = remaining.get((c["shipment_id"], i["sku"]), (short, 0, 0))
+        if claim <= 0:
+            continue
+        lines.append(f"- {i['sku']} | FNSKU {i['fnsku']} | shipped {i['shipped']}, received {i['received']}, "
+                     f"short {short} | TO CLAIM: {claim}")
     notes = ["STEPS",
              "1. Open the shipment in Seller Central and start the reconciliation / missing units case for the items below.",
              "2. Attach the packing slip that is on this task as the proof of what was shipped.",
@@ -163,13 +197,15 @@ def task_fields(c: dict, items: list[dict]) -> dict:
              f"Shipment: {c['shipment_id']}  ({c['name']})",
              f"Amazon warehouse: {c['destination_fc']}",
              f"Units shipped: {c['shipped']}   Units received: {c['received']}   Units short: {c['short']}",
-             f"Units to claim: {c['claim_units']}  (short units that Amazon has not already reimbursed"
-             + (f", less {c['over_units']} extra unit(s) Amazon received on this shipment)" if c["over_units"] else ")"),
+             f"Units to claim: {c['claim_units']}",
              "",
-             "ITEMS SHORT", *lines,
+             "ITEMS TO CLAIM (claim only these units)", *lines,
              "",
-             "Note: \"units to claim\" is the agent's estimate. Amazon's reimbursement report does not name the "
-             "shipment, so if the shipment page shows a different number of missing units, go by the shipment page."]
+             "How \"to claim\" is worked out: units short on this shipment, less units of the same item that Amazon "
+             "received as extras on our other shipments, less units Amazon already reimbursed as lost inbound. "
+             "Short items that are fully covered that way are not listed.",
+             "It is an estimate: Amazon's reports do not tie a reimbursement to a shipment. If the shipment page shows "
+             "a different number of missing units, go by the shipment page."]
     due = (datetime.now(timezone.utc).astimezone(ZoneInfo("America/New_York")) + timedelta(days=1)).date()
     return {"name": f"Short shipment | {c['shipment_id']} | {c['name']} | {c['claim_units']} unit(s) to claim",
             "notes": "\n".join(notes), "due_on": str(due)}
@@ -190,10 +226,11 @@ def make_tasks(conn, token: str, apply: bool) -> dict:
         cur.execute(CANDIDATES_SQL)
         cols = ["shipment_id", "name", "destination_fc", "shipped", "received", "short", "over_units", "claim_units"]
         cands = [dict(zip(cols, r)) for r in cur.fetchall()]
+    remaining = remaining_by_item(conn)
     planned, created, errors = [], 0, []
     for c in cands:
         items = shipment_items(conn, c["shipment_id"])
-        f = task_fields(c, items)
+        f = task_fields(c, items, remaining)
         planned.append({"task": f["name"], "items_on_slip": len(items), "units_on_slip": sum(i["shipped"] for i in items)})
         with conn.cursor() as cur:
             cur.execute("""INSERT INTO shipment_claims (shipment_id, short_units, claim_units) VALUES (%s,%s,%s)
@@ -225,22 +262,77 @@ def make_tasks(conn, token: str, apply: bool) -> dict:
             "tasks_created": created, "task_errors": errors, "planned": planned}
 
 
+def refresh_tasks(conn, token: str, apply: bool) -> dict:
+    """Bring the agent's own open tasks in line with today's numbers: correct the units to claim, and close a task
+    that has nothing left to claim. Only touches tasks still waiting in "1. To file" with no Case ID."""
+    remaining = remaining_by_item(conn)
+    secs = section_keys(token)
+    with conn.cursor() as cur:
+        cur.execute("""SELECT c.shipment_id, c.asana_task_gid, c.claim_units, s.name, s.destination_fc, s.shipped, s.received,
+                              s.over_units FROM shipment_claims c JOIN inbound_shipments s USING (shipment_id)
+                       WHERE c.asana_task_gid IS NOT NULL AND c.closed_at IS NULL""")
+        rows = cur.fetchall()
+    out = {"live": apply, "checked": len(rows), "closed": [], "corrected": [], "unchanged": 0, "left_alone": 0, "errors": []}
+    for sid, gid, old_claim, name, fc, shipped, received, over in rows:
+        try:
+            t = _asana("GET", f"/tasks/{gid}", token, params={"opt_fields": "completed,memberships.section.gid,"
+                       "memberships.project.gid,custom_fields.name,custom_fields.text_value,custom_fields.display_value"})
+        except Exception as exc:
+            out["errors"].append(f"{sid}: {exc}"[:160])
+            continue
+        sec = next((m["section"]["gid"] for m in t.get("memberships", [])
+                    if (m.get("project") or {}).get("gid") == SHIPMENT_BOARD and m.get("section")), None)
+        has_case = any((f.get("text_value") or f.get("display_value")) for f in t.get("custom_fields", [])
+                       if (f.get("name") or "").strip().lower().startswith(("case id", "sas case")))
+        if t.get("completed") or sec != secs.get("1") or has_case:
+            out["left_alone"] += 1       # already filed, moved or finished: the case watching looks after it
+            continue
+        items = shipment_items(conn, sid)
+        short = sum(max(i["shipped"] - i["received"], 0) for i in items)
+        claim = sum(remaining.get((sid, i["sku"]), (0, 0, 0))[0] for i in items if i["shipped"] > i["received"])
+        if claim == old_claim:
+            out["unchanged"] += 1
+            continue
+        c = {"shipment_id": sid, "name": name, "destination_fc": fc, "shipped": shipped, "received": received,
+             "short": short, "over_units": over, "claim_units": claim}
+        try:
+            if claim <= 0:
+                out["closed"].append(f"{sid} ({name}): was {old_claim} unit(s)")
+                if apply:
+                    _asana("POST", f"/tasks/{gid}/stories", token, json={"data": {"text":
+                           "Closing this task: nothing to claim. The units short on this shipment were received by Amazon "
+                           "as extra units on our other shipments of the same items, or have already been reimbursed. "
+                           "A case would be answered the same way."}})
+                    _asana("PUT", f"/tasks/{gid}", token, json={"data": {"completed": True}})
+                    with conn.cursor() as cur:
+                        cur.execute("UPDATE shipment_claims SET claim_units=0, closed_at=now(), last_seen=now() "
+                                    "WHERE shipment_id=%s", (sid,))
+            else:
+                out["corrected"].append(f"{sid} ({name}): {old_claim} -> {claim} unit(s)")
+                if apply:
+                    f = task_fields(c, items, remaining)
+                    _asana("PUT", f"/tasks/{gid}", token, json={"data": {"name": f["name"], "notes": f["notes"]}})
+                    _asana("POST", f"/tasks/{gid}/stories", token, json={"data": {"text":
+                           f"Units to claim corrected from {old_claim} to {claim}. Extra units of the same items that Amazon "
+                           "received on our other shipments are now taken off. The task description lists only the items "
+                           "and units to claim."}})
+                    with conn.cursor() as cur:
+                        cur.execute("UPDATE shipment_claims SET claim_units=%s, last_seen=now() WHERE shipment_id=%s",
+                                    (claim, sid))
+        except Exception as exc:
+            out["errors"].append(f"{sid}: {exc}"[:160])
+    return out
+
+
 # ------------------------------------------------------------ case watching ---
 WAIT_DAYS = int(os.environ.get("SHIPMENT_CASE_WAIT_DAYS", "14"))    # still open and unpaid after this -> SAS
 CASES_MAILBOX = os.environ.get("CASES_MAILBOX", "cases@gefenoptical.com")
 _DENIED = ("unable to", "not eligible", "cannot reimburse", "can't reimburse", "will not be reimburs", "no reimbursement",
            "completed our investigation", "investigation is complete", "have been accounted for", "declin", "denied",
            "not able to", "no further action", "claim window", "does not qualify")
-UNPAID_SQL = """
-WITH re AS (SELECT fnsku, sum(quantity_reimbursed_total) q FROM fba_reimbursements
-            WHERE reason IN ('Lost_Inbound','Damaged_Inbound') AND approval_date >= current_date - 150 GROUP BY 1),
-it AS (SELECT i.shipment_id, i.fnsku, (i.shipped - i.received) short,
-              sum(i.shipped - i.received) OVER (PARTITION BY i.fnsku ORDER BY i.shipment_id) cum
-       FROM inbound_shipment_items i JOIN inbound_shipments s USING (shipment_id)
-       WHERE s.read_version >= 2 AND i.shipped > i.received)
-SELECT s.shipment_id, coalesce(sum(greatest(least(it.short, it.cum - coalesce(re.q, 0)), 0)), 0)::int
-FROM inbound_shipments s LEFT JOIN it USING (shipment_id) LEFT JOIN re USING (fnsku)
-WHERE s.read_version >= 2 GROUP BY 1"""
+UNPAID_SQL = REMAIN_CTE + """
+SELECT c.shipment_id, coalesce(sum(r.remaining), 0)::int
+FROM inbound_closed c LEFT JOIN rem r USING (shipment_id) GROUP BY 1"""
 
 
 def monitor_live() -> bool:
@@ -416,7 +508,8 @@ def _get(token: str, path: str, params: dict) -> dict:
     raise RuntimeError(f"Amazon kept answering 429 on {path}")
 
 
-def fetch_closed_shipments(token: str, since: datetime, until: datetime, progress=None) -> tuple[list[dict], str]:
+def fetch_closed_shipments(token: str, since: datetime, until: datetime, progress=None,
+                           max_pages: int | None = None) -> tuple[list[dict], str]:
     """Closed shipments updated in the window. Returns (shipments, how the paging ended).
     Guards against Amazon handing back the same page forever."""
     import main
@@ -438,8 +531,8 @@ def fetch_closed_shipments(token: str, since: datetime, until: datetime, progres
             return out, "complete"
         if nxt in tokens or not new:
             return out, f"stopped at page {pages}: Amazon repeated a page"
-        if pages >= MAX_PAGES:
-            return out, f"stopped at the {MAX_PAGES}-page limit"
+        if pages >= (max_pages or MAX_PAGES):
+            return out, f"stopped at the {max_pages or MAX_PAGES}-page limit"
         tokens.add(nxt)
         params = {"MarketplaceId": main.MARKETPLACE_ID, "QueryType": "NEXT_TOKEN", "NextToken": nxt}
         time.sleep(0.6)
@@ -562,6 +655,29 @@ def run(dry_run: bool = True) -> dict:
         summary.update(spot_checked=checked, spot_mismatches=mismatches)
         trust_bulk = checked > 0 and not mismatches
 
+        # Keep every item line (all shipments, 420 days) and the list of closed shipments: the netting needs both.
+        if trust_bulk:
+            progress("saving all shipment items for the cross-shipment check")
+            with conn.transaction(), conn.cursor() as cur:
+                cur.execute("TRUNCATE inbound_items_all")
+                with cur.copy("COPY inbound_items_all (shipment_id, sku, fnsku, shipped, received) FROM STDIN") as cp:
+                    for sid_, by_sku in bulk.items():
+                        for sku_, i in by_sku.items():
+                            cp.write_row((sid_, sku_, i.get("FulfillmentNetworkSKU"), int(i.get("QuantityShipped") or 0),
+                                          int(i.get("QuantityReceived") or 0)))
+            with conn.cursor() as cur:
+                cur.execute("SELECT count(*) FROM inbound_closed")
+                first_time = cur.fetchone()[0] == 0
+            closed_ids = [x["ShipmentId"] for x in shipments]
+            if first_time:      # once: every shipment closed in the last 420 days, so older shortages are counted too
+                older, how_older = fetch_closed_shipments(token, now - timedelta(days=ITEM_LOOKBACK_DAYS), now, progress, 900)
+                closed_ids += [x["ShipmentId"] for x in older]
+                summary["closed_420_days"] = f"{len(older)} ({how_older})"
+            with conn.cursor() as cur:
+                cur.executemany("INSERT INTO inbound_closed (shipment_id) VALUES (%s) ON CONFLICT DO NOTHING",
+                                [(x,) for x in dict.fromkeys(closed_ids)])
+        summary["netting_ready"] = trust_bulk
+
         read = 0
         for n, s in enumerate(shipments):
             sid = s["ShipmentId"]
@@ -614,11 +730,17 @@ def run(dry_run: bool = True) -> dict:
                 summary["boards_error"] = f"{type(exc).__name__}: {exc}"[:300]
         boards_ok = isinstance(summary.get("boards"), dict) and not any(
             str(v).startswith("could not read") for v in summary["boards"].values())
-        if boards_ok:      # never plan or create tasks on a day the boards could not be checked
+        if boards_ok and trust_bulk:      # never plan or create tasks on a day the boards or the items could not be read
+            progress("checking the agent's open tasks against today's numbers")
+            try:
+                summary["task_refresh"] = refresh_tasks(conn, os.environ["ASANA_TOKEN"],
+                                                        apply=live() and os.environ.get("SHIPMENT_REFRESH_LIVE", "0") == "1")
+            except Exception as exc:
+                summary["task_refresh_error"] = f"{type(exc).__name__}: {exc}"[:300]
             progress("working out which short shipments need a task")
             summary["tasks"] = make_tasks(conn, os.environ["ASANA_TOKEN"], apply=live())
         else:
-            summary["tasks"] = "skipped: the boards could not be checked, so no task was planned or created"
+            summary["tasks"] = "skipped: the boards or the shipment items could not be read, so no task was planned or created"
         if os.environ.get("ASANA_TOKEN"):
             progress("watching the shipment cases")
             try:
