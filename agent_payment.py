@@ -56,6 +56,9 @@ LOSS_LOOKBACK_DAYS = 60      # how far before the approval date the loss line ca
 ORIGIN_LOOKBACK_DAYS = 400   # how far back we look for how the unit got its status
 REGRADE_NEAR_DAYS = 45       # "Amazon re-graded it at this warehouse shortly before it was lost"
 MIN_SHORTFALL = Decimal("1.00")
+MIN_DAYS_LEFT = int(os.environ.get("PAYMENT_AGENT_MIN_DAYS_LEFT", "10"))   # no new task this close to Amazon's 60-day cut-off
+TRACE_BACK_DAYS = 7          # a unit moved out of customer damaged/defective this shortly before the loss is the same unit
+HALF_TOLERANCE = Decimal("0.01")
 
 LOST_CODES = ("M", "5")
 DAMAGED_CODES = ("E", "H", "K", "U", "6")
@@ -374,7 +377,16 @@ def classify(group: dict, adjustments: list[dict], returns: list[dict],
         if len({a["disposition"] for a in cands}) > 1:
             notes.append("This item had losses in more than one status that month. Confirm in the Inventory "
                          f"Ledger that this unit was {_pretty(status)} before filing.")
-        if status == "SELLABLE":
+        # Amazon pays by what the unit was BEFORE the warehouse re-labelled it: a customer-damaged unit that was moved
+        # to carrier damaged / warehouse damaged / sellable at the same warehouse and then written off is still 50%.
+        was = [a for a in adjustments if a["reason"] == "Q" and a["quantity"] < 0 and a["disposition"] in HALF_STATUSES
+               and a["fc"] == loss_fc and loss_date - timedelta(days=TRACE_BACK_DAYS) <= a["event_date"] <= loss_date] \
+            if status not in HALF_STATUSES else []
+        if was:
+            first = max(was, key=lambda a: a["event_date"])
+            rule, pct = (f"Unit was {_pretty(first['disposition'])} until the warehouse re-labelled it "
+                         f"{_pretty(status)} at {loss_fc} on {first['event_date']:%b %-d}"), 50
+        elif status == "SELLABLE":
             rule, pct = "Sellable unit", 100
         elif status in HALF_STATUSES:
             since = loss_date - timedelta(days=ORIGIN_LOOKBACK_DAYS)
@@ -408,6 +420,13 @@ def classify(group: dict, adjustments: list[dict], returns: list[dict],
     out.update(cost=cost, correct_total=correct, shortfall=short, check_note=" ".join(notes) or None)
     if short / qty < MIN_SHORTFALL:
         return {**out, "verdict": "ok_50" if pct == 50 else "ok"}
+    if pct == 100:
+        # Amazon paid exactly half of the cost: it graded the unit unsellable. A re-evaluation is only accepted for
+        # units reimbursed in sellable condition, so this is declined every time.
+        each = paid / qty
+        for base in (approved_cost, cost):
+            if base and abs(each - Decimal(base) / 2) <= Decimal(base) * HALF_TOLERANCE:
+                return {**out, "verdict": "paid_half_unsellable"}
     return {**out, "verdict": "claim"}
 
 
@@ -591,6 +610,65 @@ def housekeeping(conn, token: str, sections: dict) -> dict:
                    f"Due date was changed. It is locked to the day after the task was created, so it was put back to {want}."}})
             reset += 1
     return {"due_dates_put_back": reset, "tasks_completed": completed}
+
+
+def close_obsolete(conn, token: str, fresh: dict, today: date, apply: bool) -> dict:
+    """Close this agent's open tasks that Amazon will decline whatever we send:
+    - Amazon paid exactly half of the cost (it graded the unit unsellable), or the ledger shows the unit was customer
+      damaged before the warehouse re-labelled it and 50% is what was paid;
+    - Amazon's 60-day window has passed and no case was ever opened."""
+    with conn.cursor() as cur:
+        cur.execute("""SELECT reimbursement_id, sku, asana_task_gid, deadline, pct, case_id, sas_case_id, shortfall
+                       FROM payment_claims WHERE asana_task_gid IS NOT NULL AND task_completed_at IS NULL""")
+        rows = cur.fetchall()
+    closed_sec = next((x["gid"] for x in _asana("GET", f"/projects/{ASANA_PROJECT_GID}/sections", token)
+                       if x["name"].strip().lower().startswith("closed")), None)
+    out = {"apply": apply, "closed": [], "errors": []}
+    for rid, sku, gid, deadline, pct, case_id, sas_id, short in rows:
+        f = fresh.get((rid, sku)) or {}
+        why = retask = None
+        if pct == 100 and f.get("verdict") == "paid_half_unsellable":
+            why = ("Closing this task: nothing to claim. Amazon paid exactly half of the sourcing cost, which means it "
+                   "graded this unit unsellable (customer damaged or defective). Amazon only re-evaluates units that "
+                   "were reimbursed in sellable condition, so a case or an SAS case is declined. Do not open one.")
+        elif pct == 100 and f.get("pct") == 50 and f.get("verdict") in ("ok_50", "claim"):
+            why = (f"Closing this task: the 100% claim was wrong. {f.get('rule')}. Amazon pays 50% for a unit that came "
+                   "back from a customer damaged, even when the warehouse re-labels it afterwards. "
+                   + ("The 50% Amazon paid is correct. Do not open a case or an SAS case."
+                      if f["verdict"] == "ok_50" else "A new task for the 50% amount will be created."))
+            retask = f["verdict"] == "claim"
+        elif deadline and deadline < today and not case_id and not sas_id:
+            why = (f"Closing this task: Amazon's 60-day window for this reimbursement ended on {deadline:%b %-d} and no "
+                   "case was opened. Amazon declines re-evaluation requests after 60 days.")
+        if not why:
+            continue
+        item = {"reimbursement_id": rid, "sku": sku, "gid": gid, "shortfall": str(short), "why": why[:90]}
+        if apply:
+            try:
+                t = _asana("GET", f"/tasks/{gid}", token,
+                           params={"opt_fields": "completed,custom_fields.name,custom_fields.display_value"})
+                has_case = any((cf.get("name") or "").lower().startswith(("case id", "sas case")) and cf.get("display_value")
+                               for cf in t.get("custom_fields", []))
+                if t.get("completed") or (has_case and "60-day window" in why):
+                    continue                     # a case was opened after all: the case monitor owns it
+                if closed_sec:
+                    _asana("POST", f"/sections/{closed_sec}/addTask", token, json={"data": {"task": gid}})
+                _asana("POST", f"/tasks/{gid}/stories", token, json={"data": {"text": why}})
+                _asana("PUT", f"/tasks/{gid}", token, json={"data": {"completed": True}})
+                with conn.cursor() as cur:
+                    cur.execute("""UPDATE payment_claims SET task_completed_at=now(), monitor_state='closed_by_agent',
+                                     monitor_note=%s WHERE reimbursement_id=%s AND sku=%s""", (why, rid, sku))
+                    if retask:
+                        cur.execute("""UPDATE payment_claims SET asana_task_gid=NULL, task_created_at=NULL,
+                                         task_completed_at=NULL, invoice_attached_at=NULL, invoice_attach_tries=0,
+                                         submitted_at=NULL, sas_submitted_at=NULL, monitor_state=NULL
+                                       WHERE reimbursement_id=%s AND sku=%s""", (rid, sku))
+            except Exception as exc:
+                out["errors"].append(f"{rid}: {type(exc).__name__}: {exc}")
+                continue
+        out["closed"].append(item)
+    out["count"] = len(out["closed"])
+    return out
 
 
 def sku_numbers(sku: str) -> list[str]:
@@ -847,6 +925,9 @@ def run(dry_run: bool = False, refresh_costs: bool = True, today: date | None = 
             fresh[(c["reimbursement_id"], c["sku"])] = c
             if c["verdict"] == "claim" and c["reimbursement_id"] in filed:
                 c["verdict"] = "filed_by_hand"
+            if c["verdict"] == "claim" and (c["reimbursement_id"], c["sku"]) not in tasked \
+                    and (c["deadline"] - today).days < MIN_DAYS_LEFT:
+                c["verdict"] = "too_late"       # Amazon declines anything filed after day 60; not enough time left
             counts[c["verdict"]] = counts.get(c["verdict"], 0) + 1
             if c["verdict"] == "claim" and c["reason"] not in live and (c["reimbursement_id"], c["sku"]) not in tasked:
                 held[c["reason"]] = held.get(c["reason"], 0) + 1      # listed for review, no task yet
@@ -897,6 +978,12 @@ def run(dry_run: bool = False, refresh_costs: bool = True, today: date | None = 
                 summary["monitor"] = case_monitor.monitor(conn, token, fresh, dry_run)
             except Exception as exc:
                 summary["monitor_error"] = f"{type(exc).__name__}: {exc}"
+        if token:
+            _set_step("closing tasks that can no longer be won")
+            try:
+                summary["closed_obsolete"] = close_obsolete(conn, token, fresh, today, apply=not dry_run)
+            except Exception as exc:
+                summary["closed_obsolete_error"] = f"{type(exc).__name__}: {exc}"
         summary.update(new_claims=len(to_task), tasks_created=created,
                        shortfall_new_claims=str(sum((c["shortfall"] for c in to_task), Decimal("0"))),
                        task_errors=errors)
