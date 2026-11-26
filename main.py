@@ -313,6 +313,12 @@ except Exception as _agent_payment_exc:  # pragma: no cover
     print(f"payment accuracy agent not mounted: {type(_agent_payment_exc).__name__}: {_agent_payment_exc}")
 
 try:
+    from weekly_report import router as weekly_report_router
+    app.include_router(weekly_report_router)
+except Exception as _weekly_report_exc:  # pragma: no cover
+    print(f"weekly report not mounted: {type(_weekly_report_exc).__name__}: {_weekly_report_exc}")
+
+try:
     from agent_refunds import router as agent_refunds_router
     app.include_router(agent_refunds_router)
 except Exception as _agent_refunds_exc:  # pragma: no cover

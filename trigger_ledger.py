@@ -55,4 +55,10 @@ if os.environ.get("REFUND_AGENT", "1") != "0":
     except requests.RequestException as exc:
         print("refunds agent: request failed:", exc)
 
+try:   # the Monday report: saves a preview every day, creates the task on Mondays when it is switched on
+    r = requests.post(f"{url}/agents/report/run", headers=headers, timeout=120)
+    print("weekly report:", r.status_code, r.text)
+except requests.RequestException as exc:
+    print("weekly report: request failed:", exc)
+
 sys.exit(0 if ok else 1)

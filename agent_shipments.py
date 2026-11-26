@@ -826,9 +826,9 @@ def run(dry_run: bool = True) -> dict:
             except Exception as exc:
                 summary["task_refresh_error"] = f"{type(exc).__name__}: {exc}"[:300]
             progress("working out which short shipments need a task")
-            # creating tasks stays off until the matching has been checked against what Azel found by hand
+            # Cassie, Nov 26: run it going forward with the reimbursement matching (SHIPMENT_TASKS_PAUSED=1 stops it)
             summary["tasks"] = make_tasks(conn, os.environ["ASANA_TOKEN"],
-                                          apply=live() and os.environ.get("SHIPMENT_MATCH_VERIFIED") == "1")
+                                          apply=live() and os.environ.get("SHIPMENT_TASKS_PAUSED") != "1")
             try:
                 per = unpaid_by_shipment(conn)
                 with conn.cursor() as cur:
