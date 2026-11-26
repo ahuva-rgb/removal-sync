@@ -395,16 +395,14 @@ def classify(group: dict, adjustments: list[dict], returns: list[dict],
                         and a["reason"] in REGRADE_IN_CODES and since <= a["event_date"] <= loss_date]
             near = [a for a in regraded if a["fc"] == loss_fc
                     and a["event_date"] >= loss_date - timedelta(days=REGRADE_NEAR_DAYS)]
-            if regraded and not came_back:
-                rule, pct = "Amazon re-graded the unit itself (no customer returns)", 100
-            elif near:
-                when = max(a["event_date"] for a in near)
-                rule, pct = f"Amazon re-graded the unit at {loss_fc} on {when:%b %-d}", 100
-            elif came_back:
+            # Cassie, Nov 26: an unsellable unit is never claimed at 100%. Amazon pays 50% of the sourcing cost for
+            # customer damaged / defective stock however it got that status, and declines anything more.
+            if came_back:
                 rule, pct = "Customer return", 50
+            elif regraded:
+                rule, pct = f"Unsellable ({_pretty(status)}) when it was lost; Amazon pays 50% for unsellable units", 50
             else:
                 rule, pct = "Customer damaged/defective, origin not in the ledger", 50
-                notes.append("The ledger does not show how this unit became unsellable. Claimed at 50%.")
         else:
             rule, pct = f"{_pretty(status).capitalize()} (not caused by a customer)", 100
 
@@ -452,14 +450,17 @@ def case_wording(c: dict) -> str:
     where = f" ({c['loss_fc']}, {c['loss_date']:%b %-d, %Y})" if c.get("loss_fc") else ""
     lines = []
     if c["pct"] == 50:
-        lines += [f"Reimbursement ID {c['reimbursement_id']} was paid below 50% of our sourcing cost.",
+        ok = "approved " if c.get("steps_version") == "B" else ""
+        lines += [f"Reimbursement ID {c['reimbursement_id']} was paid below 50% of our {ok}sourcing cost.",
                   f"SKU: {c['sku']} | FNSKU: {c['fnsku']} | ASIN: {c['asin']}",
                   (f"This reimbursement was for {kind}{order}. The customer returned the unit as "
-                   f"{_pretty(c['status_when_lost'])}. We understand only 50% of sourcing cost applies." if kind else
-                   f"The unit was in {_pretty(c['status_when_lost'])} condition when it was {event}{where}. "
-                   "We understand only 50% of sourcing cost applies."),
-                  f"Sourcing cost: {_money(c['cost'])} per unit (invoice attached)",
-                  f"50% of sourcing cost: {_money(c['cost'] / 2)} per unit"]
+                   f"{_pretty(c['status_when_lost'])}." if kind else
+                   f"The unit was in {_pretty(c['status_when_lost'])} condition when it was {event}{where}."),
+                  "We accept that an unsellable unit is reimbursed at 50%. The FBA inventory reimbursement policy says "
+                  "that for items in unsellable condition \"Amazon reimburses 50% of the approved sourcing cost\". "
+                  "This unit was paid at 50% of Amazon's own estimate instead of 50% of our sourcing cost.",
+                  f"{ok.capitalize() or 'Our '}sourcing cost: {_money(c['cost'])} per unit (invoice attached)".replace("Our sourcing", "Sourcing"),
+                  f"50% of that sourcing cost: {_money(Decimal(c['correct_total']) / max(int(c['quantity']), 1))} per unit"]
     elif c["status_when_lost"] in HALF_STATUSES:
         lines += [f"Reimbursement ID {c['reimbursement_id']} was paid at 50% of our sourcing cost, but the full cost applies.",
                   f"SKU: {c['sku']} | FNSKU: {c['fnsku']} | ASIN: {c['asin']}",

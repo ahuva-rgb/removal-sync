@@ -244,7 +244,15 @@ def net_claims(conn) -> dict:
         cur.execute("""SELECT shipment_id, sum(greatest(received - shipped, 0)) FROM inbound_items_all
                        GROUP BY 1 HAVING sum(greatest(received - shipped, 0)) > 0""")
         extra = dict(cur.fetchall())
-    return {sid: max(n - int(extra.get(sid, 0)), 0) for sid, n in per.items()}
+    out = {sid: max(n - int(extra.get(sid, 0)), 0) for sid, n in per.items()}
+    # Cassie, Nov 26: "if we shipped in 170 and received 170 no case should be opened". The shipment's own totals
+    # (read one shipment at a time) are the last word: never claim more than shipped minus received.
+    with conn.cursor() as cur:
+        cur.execute("SELECT shipment_id, shipped, received FROM inbound_shipments WHERE shipment_id = ANY(%s)", (list(out),))
+        for sid, shipped, received in cur.fetchall():
+            if shipped is not None and received is not None:
+                out[sid] = min(out[sid], max(int(shipped) - int(received), 0))
+    return out
 
 
 def candidates(conn) -> list[dict]:
